@@ -1,0 +1,78 @@
+# tui::style -- colours and text attributes.
+#
+# A colour is an Int: -1 is the terminal's default colour, 0..255 is the
+# xterm palette (0-7 standard, 8-15 bright), and -2 means "keep whatever is
+# already underneath" (a transparent colour, resolved when a canvas is
+# rasterised).  Any other Int is treated as the default colour.
+
+default_color = -1
+keep = -2
+
+black = 0
+red = 1
+green = 2
+yellow = 3
+blue = 4
+magenta = 5
+cyan = 6
+white = 7
+bright_black = 8
+bright_red = 9
+bright_green = 10
+bright_yellow = 11
+bright_blue = 12
+bright_magenta = 13
+bright_cyan = 14
+bright_white = 15
+
+bold_bit = 1
+dim_bit = 2
+italic_bit = 4
+underline_bit = 8
+reverse_bit = 16
+
+struct Style:
+    fg: int
+    bg: int
+    attrs: int
+
+fn plain() -> Style:
+    Style {fg: -1, bg: -1, attrs: 0}
+
+fn transparent() -> Style:
+    Style {fg: -2, bg: -2, attrs: 0}
+
+private fn valid_color(color: int) -> int:
+    if color < -2 or color > 255:
+        return -1
+    color
+
+fn with_fg(style: Style, color: int) -> Style:
+    Style {fg: valid_color(color), bg: style.bg, attrs: style.attrs}
+
+fn with_bg(style: Style, color: int) -> Style:
+    Style {fg: style.fg, bg: valid_color(color), attrs: style.attrs}
+
+fn with_attr(style: Style, bit: int) -> Style:
+    Style {fg: style.fg, bg: style.bg, attrs: bit_or(style.attrs, bit_and(bit, 31))}
+
+fn has_attr?(style: Style, bit: int) -> bool:
+    bit_and(style.attrs, bit) != 0
+
+fn bold(style: Style) -> Style:
+    style.with_attr(1)
+
+fn dim(style: Style) -> Style:
+    style.with_attr(2)
+
+fn italic(style: Style) -> Style:
+    style.with_attr(4)
+
+fn underline(style: Style) -> Style:
+    style.with_attr(8)
+
+fn reverse(style: Style) -> Style:
+    style.with_attr(16)
+
+nomethod fn colors(fg: int, bg: int) -> Style:
+    plain().with_fg(fg).with_bg(bg)

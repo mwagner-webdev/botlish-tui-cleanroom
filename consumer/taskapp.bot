@@ -1,0 +1,178 @@
+# taskapp -- a small task list built on the tui package.
+#
+# This module is the application's STATE MACHINE and VIEW.  It never touches a
+# terminal: tests (test.bot) drive it with decoded events, and demo.bot hands
+# it to tui::session::run.  It satisfies the tui::session::Application
+# interface by declaring update, view and finished? for its own State type.
+#
+#     state + event      -> next state     update
+#     state + dimensions -> canvas         view
+
+import std::list
+import std::str
+import std::int
+import tui::style
+import tui::text
+import tui::input
+import tui::canvas
+import tui::layout
+import tui::widgets
+import tui::app
+
+struct Task:
+    title: str
+    done: bool
+
+# Which control has the keyboard (the index inside State.focus).
+list_focus = 0
+entry_focus = 1
+add_focus = 2
+
+struct State:
+    tasks: List[Task]
+    list: tui::widgets::ListState
+    entry: tui::widgets::TextInput
+    focus: tui::widgets::Focus
+    status: str
+    quit: bool
+
+fn row_text(task: Task) -> str:
+    if task.done:
+        return "[x] ".concat(task.title)
+    "[ ] ".concat(task.title)
+
+fn rows(tasks: List[Task]) -> List[str]:
+    loop task in tasks:
+        row_text(task)
+
+fn initial() -> State:
+    tasks = [Task {title: "Read the guide", done: true}, Task {title: "Write a task app", done: false}, Task {title: "Run it in a terminal", done: false}]
+    State {tasks: tasks, list: tui::widgets::list_state(rows(tasks)), entry: tui::widgets::text_input(""), focus: tui::widgets::focus(3), status: "Ready", quit: false}
+
+fn with_status(state: State, status: str) -> State:
+    State {tasks: state.tasks, list: state.list, entry: state.entry, focus: state.focus, status: status, quit: state.quit}
+
+fn with_tasks(state: State, tasks: List[Task], selected: int, status: str) -> State:
+    shown = state.list.list_replace(rows(tasks)).list_select(selected)
+    State {tasks: tasks, list: shown, entry: state.entry, focus: state.focus, status: status, quit: state.quit}
+
+fn count_done(tasks: List[Task]) -> int:
+    fold task in tasks with intermediate n 0:
+        if task.done:
+            n + 1
+        else:
+            n
+
+fn if_done(done: bool) -> str:
+    if done:
+        return "done"
+    "not done"
+
+fn toggle(state: State) -> State:
+    i = state.list.selected
+    if i < 0 or i >= state.tasks.length():
+        return state.with_status("Nothing to toggle")
+    tasks = loop k from 0 to state.tasks.length():
+        task = state.tasks.at(k)
+        if k == i:
+            Task {title: task.title, done: not task.done}
+        else:
+            task
+    now = tasks.get(i, Task {title: "", done: false})
+    state.with_tasks(tasks, i, "Marked '".concat(now.title).concat("' as ").concat(if_done(now.done)))
+
+fn delete_selected(state: State) -> State:
+    i = state.list.selected
+    if i < 0 or i >= state.tasks.length():
+        return state.with_status("Nothing to delete")
+    gone = state.tasks.get(i, Task {title: "", done: false})
+    kept = loop k from 0 to state.tasks.length():
+        if k == i:
+            continue
+        state.tasks.at(k)
+    state.with_tasks(kept, i, "Deleted '".concat(gone.title).append_char('\''))
+
+fn add_task(state: State) -> State:
+    title = state.entry.input_text()
+    if title.length() == 0:
+        return state.with_status("Type a title first")
+    tasks = [state.tasks, [Task {title: title, done: false}]].flat()
+    added = State {tasks: state.tasks, list: state.list, entry: tui::widgets::text_input(""), focus: state.focus, status: state.status, quit: state.quit}
+    added.with_tasks(tasks, tasks.length() - 1, "Added '".concat(title).append_char('\''))
+
+fn with_focus(state: State, focus: tui::widgets::Focus) -> State:
+    State {tasks: state.tasks, list: state.list, entry: state.entry, focus: focus, status: state.status, quit: state.quit}
+
+fn with_entry(state: State, entry: tui::widgets::TextInput) -> State:
+    State {tasks: state.tasks, list: state.list, entry: entry, focus: state.focus, status: state.status, quit: state.quit}
+
+fn with_list(state: State, list: tui::widgets::ListState) -> State:
+    State {tasks: state.tasks, list: list, entry: state.entry, focus: state.focus, status: state.status, quit: state.quit}
+
+fn quitting(state: State) -> State:
+    State {tasks: state.tasks, list: state.list, entry: state.entry, focus: state.focus, status: "Bye", quit: true}
+
+# Keys while the list has the focus.
+fn list_event(state: State, event: tui::input::Event) -> State:
+    if tui::widgets::activated?(event):
+        return state.toggle()
+    if event.is_char?(100):
+        return state.delete_selected()
+    if event.is_char?(113):
+        return state.quitting()
+    state.with_list(state.list.list_update(event))
+
+# Keys while the entry field has the focus.
+fn entry_event(state: State, event: tui::input::Event) -> State:
+    if event.is_key?(tui::input::Kind::Enter):
+        return state.add_task()
+    if event.is_key?(tui::input::Kind::Escape):
+        return state.with_entry(tui::widgets::text_input("")).with_status("Entry cleared")
+    state.with_entry(state.entry.input_update(event))
+
+fn button_event(state: State, event: tui::input::Event) -> State:
+    if tui::widgets::activated?(event):
+        return state.add_task()
+    state
+
+fn focused_event(state: State, event: tui::input::Event) -> State:
+    if state.focus.index == 0:
+        return state.list_event(event)
+    if state.focus.index == 1:
+        return state.entry_event(event)
+    state.button_event(event)
+
+# The state machine: state + event -> next state.  Ctrl+C quits from anywhere;
+# Ctrl+X fails on purpose, to show an application error leaving tui::session::run.
+fn update(state: State, event: tui::input::Event) -> State errors tui::app::Abort:
+    if event.is_ctrl?(99):
+        return state.quitting()
+    if event.is_ctrl?(120):
+        fail tui::app::Abort {reason: "Ctrl+X pressed: simulated application failure"}
+    if event.kind == tui::input::Kind::Resize:
+        shown = state.list.with_page(event.height - 9)
+        return state.with_list(shown).with_status("Resized to ".concat(std::int::to_string(event.width)).append_char('x').concat(std::int::to_string(event.height)))
+    if event.kind == tui::input::Kind::Tab or event.kind == tui::input::Kind::BackTab:
+        return state.with_focus(state.focus.focus_update(event))
+    state.focused_event(event)
+
+fn finished?(state: State) -> bool:
+    state.quit
+
+fn title_text(state: State) -> str:
+    " Tasks: ".concat(std::int::to_string(state.tasks.length())).concat(", done: ").concat(std::int::to_string(count_done(state.tasks))).append_char(' ')
+
+# state + dimensions -> a layout description, drawn onto a canvas.
+fn view(state: State, width: int, height: int) -> tui::canvas::Canvas:
+    plain = tui::style::plain()
+    list_height = height - 9
+    focus = state.focus
+    list_style = tui::style::plain().with_fg(tui::style::cyan)
+    marker = tui::style::colors(tui::style::black, tui::style::cyan)
+    tasks_box = state.list.list_node(list_height, focus.focused?(0), list_style, marker).boxed("Tasks", tui::canvas::BorderKind::Rounded, plain).with_flex(1)
+    entry_row = tui::layout::hstack([tui::layout::label("New task: ", plain), state.entry.input_node(width - 16, focus.focused?(1), plain)])
+    entry_box = entry_row.boxed("Entry", tui::canvas::BorderKind::Single, plain).with_height(3)
+    buttons = tui::layout::hstack([tui::widgets::button("Add", focus.focused?(2), plain), tui::layout::label("  ", plain), tui::layout::label("Ctrl+C quits", tui::style::plain().dim())])
+    help = tui::layout::label("Tab focus | Up/Down select | Space toggle | d delete | q quit", tui::style::plain().dim())
+    ui = tui::layout::vstack([tui::widgets::status_bar(title_text(state), tui::style::plain().bold()), tasks_box, entry_box, buttons, help, tui::widgets::status_bar(state.status, plain)])
+    tui::canvas::new(width, height).draw(ui)

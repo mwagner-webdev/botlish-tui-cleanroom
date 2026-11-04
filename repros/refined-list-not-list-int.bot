@@ -1,0 +1,12 @@
+# List[int[Byte]] is not accepted where List[int] is declared (invariant element refinement).
+import std::str
+import std::list
+
+fn total(xs: List[int]) -> int:
+    fold x in xs with intermediate a 0:
+        a + x
+
+fn f(s: str) -> int:
+    total(s.encode_utf8())
+
+f("ab")

@@ -1,0 +1,32 @@
+direct module
+import std::abi
+import std::abi::bytes
+import std::abi::x86_64
+import std::linux::abi::x86_64
+import std::binary
+import std::byte
+
+layout Termios:
+    size 36
+    align 4
+    field iflag: std::binary::U32 at 0
+    field oflag: std::binary::U32 at 4
+    field cflag: std::binary::U32 at 8
+    field lflag: std::binary::U32 at 12
+    field line: std::binary::U8 at 16
+    field cc: array 19 of std::binary::U8 at 17
+
+struct IoctlResult:
+    rc: int
+    data: std::abi::bytes::MutableBytes
+
+fn ioctl(fd: std::abi::I32, req: std::abi::U32, buf: std::abi::bytes::MutableBytes) -> IoctlResult:
+    d = std::abi::bytes::detach(buf)
+    rc = std::linux::abi::x86_64::syscall({rax: std::abi::x86_64::register64(16), rdi: std::abi::x86_64::from_i32(fd), rsi: std::abi::x86_64::from_u32(req), rdx: std::abi::x86_64::from_mutable_bytes(d)})
+    IoctlResult {rc: std::abi::x86_64::to_int(rc), data: d}
+
+r = ioctl(std::abi::i32(0), std::abi::u32(21505), std::abi::bytes::zeroed(std::abi::usize(36)))
+t = std::binary::parse(Termios, std::abi::bytes::freeze(r.data)):
+    on LayoutLengthMismatch:
+        LayoutStruct[Termios] {iflag: 0, oflag: 0, cflag: 0, lflag: 0, line: 0, cc: []}
+[r.rc, t.iflag, t.oflag, t.cflag, t.lflag]

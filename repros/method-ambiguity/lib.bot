@@ -1,0 +1,8 @@
+struct Canvas:
+    w: int
+
+struct Screen:
+    w: int
+
+fn screen(c: Canvas) -> Screen:
+    Screen {w: c.w}

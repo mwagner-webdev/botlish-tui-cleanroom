@@ -1,0 +1,144 @@
+# test -- deterministic tests of taskapp's state machine and view, with no
+# terminal at all: events are plain values, screens are plain values.
+#
+#   botlish -backend interp test.bot            (every backend gives the same report)
+import std::list
+import std::str
+import std::test
+import taskapp
+import tui::app
+import tui::canvas
+import tui::input
+import tui::widgets
+
+fn s(c: UnicodeChar) -> str:
+    "".append_char(c)
+
+# Feed text (decoded to events, as the terminal would deliver it) to the state
+# machine; an application failure leaves the state as it was and sets Abort's reason.
+fn feed(state: taskapp::State, text: str) -> taskapp::State:
+    events = tui::input::decode_text(text)
+    fold e in events with intermediate st state:
+        st.update(e):
+            on tui::app::Abort {reason}:
+                st.with_status(reason)
+
+fn feed_event(state: taskapp::State, event: tui::input::Event) -> taskapp::State:
+    state.update(event):
+        on tui::app::Abort {reason}:
+            state.with_status(reason)
+
+fn press(state: taskapp::State, kind: tui::input::Kind) -> taskapp::State:
+    state.feed_event(tui::input::key(kind))
+
+fn titles(state: taskapp::State) -> List[str]:
+    state.list.items
+
+fn lines(state: taskapp::State, width: int, height: int) -> List[str]:
+    state.view(width, height).rasterize().lines()
+
+fn reg_state():
+    fn initial_state():
+        st = taskapp::initial()
+        {rows: st.titles(), selected: st.list.selected, status: st.status, focus: st.focus.index, quit: st.finished?()}
+    std::test::value("task app: initial state", {rows: ["[x] Read the guide", "[ ] Write a task app", "[ ] Run it in a terminal"], selected: 0, status: "Ready", focus: 0, quit: false}, initial_state)
+
+    fn navigation():
+        st = taskapp::initial().press(tui::input::Kind::Down).press(tui::input::Kind::Down).press(tui::input::Kind::Down)
+        {selected: st.list.selected, up: st.press(tui::input::Kind::Up).list.selected, home: st.press(tui::input::Kind::Home).list.selected}
+    std::test::value("task app: arrows move the selection and stop at the ends", {selected: 2, up: 1, home: 0}, navigation)
+
+    fn toggling():
+        st = taskapp::initial().press(tui::input::Kind::Down).feed(s(' '))
+        again = st.feed(s(' '))
+        {rows: st.titles(), status: st.status, back: again.titles()}
+    std::test::value("task app: Space toggles the selected task", {rows: ["[x] Read the guide", "[x] Write a task app", "[ ] Run it in a terminal"], status: "Marked 'Write a task app' as done", back: ["[x] Read the guide", "[ ] Write a task app", "[ ] Run it in a terminal"]}, toggling)
+
+    fn deleting():
+        st = taskapp::initial().press(tui::input::Kind::Down).feed(s('d'))
+        {rows: st.titles(), selected: st.list.selected, status: st.status}
+    std::test::value("task app: d deletes the selected task", {rows: ["[x] Read the guide", "[ ] Run it in a terminal"], selected: 1, status: "Deleted 'Write a task app'"}, deleting)
+
+    fn deleting_everything():
+        st = taskapp::initial().feed("ddd")
+        {rows: st.titles(), selected: st.list.selected, more: st.feed(s('d')).status, toggle: st.feed(s(' ')).status}
+    std::test::value("task app: deleting every task leaves an empty list that is still safe", {rows: [], selected: -1, more: "Nothing to delete", toggle: "Nothing to toggle"}, deleting_everything)
+
+    fn adding_a_task():
+        st = taskapp::initial().press(tui::input::Kind::Tab).feed("buy milk\r")
+        {rows: st.titles(), selected: st.list.selected, status: st.status, entry: st.entry.input_text(), focus: st.focus.index}
+    std::test::value("task app: Tab to the entry, type a title, Enter adds it", {rows: ["[x] Read the guide", "[ ] Write a task app", "[ ] Run it in a terminal", "[ ] buy milk"], selected: 3, status: "Added 'buy milk'", entry: "", focus: 1}, adding_a_task)
+
+    fn empty_title_is_refused():
+        st = taskapp::initial().press(tui::input::Kind::Tab).feed(s('\r'))
+        {rows: st.titles().length(), status: st.status}
+    std::test::value("task app: an empty title is refused", {rows: 3, status: "Type a title first"}, empty_title_is_refused)
+
+    fn add_button():
+        st = taskapp::initial().press(tui::input::Kind::Tab).feed("x1").press(tui::input::Kind::Tab).feed(s(' '))
+        {count: st.titles().length(), status: st.status, focus: st.focus.index}
+    std::test::value("task app: the Add button adds from the entry", {count: 4, status: "Added 'x1'", focus: 2}, add_button)
+
+    fn entry_editing():
+        st = taskapp::initial().press(tui::input::Kind::Tab).feed("abc").press(tui::input::Kind::Left).press(tui::input::Kind::Backspace)
+        {text: st.entry.input_text(), cursor: st.entry.cursor, cleared: st.feed(s(' ')).press(tui::input::Kind::Escape).entry.input_text()}
+    std::test::value("task app: the entry field edits and Escape clears it", {text: "ac", cursor: 1, cleared: ""}, entry_editing)
+
+    fn focus_cycle():
+        st = taskapp::initial()
+        a = st.press(tui::input::Kind::Tab)
+        b = a.press(tui::input::Kind::Tab)
+        c = b.press(tui::input::Kind::Tab)
+        {entry: a.focus.index, button: b.focus.index, list: c.focus.index, back: st.press(tui::input::Kind::BackTab).focus.index}
+    std::test::value("task app: Tab and Shift+Tab cycle the focus", {entry: 1, button: 2, list: 0, back: 2}, focus_cycle)
+
+    fn typing_q_in_entry_does_not_quit():
+        st = taskapp::initial().press(tui::input::Kind::Tab).feed("quit")
+        {quit: st.finished?(), text: st.entry.input_text()}
+    std::test::value("task app: q only quits while the list has the focus", {quit: false, text: "quit"}, typing_q_in_entry_does_not_quit)
+
+    fn quitting():
+        {q: taskapp::initial().feed(s('q')).finished?(), ctrl_c: taskapp::initial().press(tui::input::Kind::Tab).feed_event(tui::input::ctrl_char(99)).finished?(), status: taskapp::initial().feed(s('q')).status}
+    std::test::value("task app: q (list) and Ctrl+C (anywhere) quit", {q: true, ctrl_c: true, status: "Bye"}, quitting)
+
+    fn events_after_quit_are_ignored_by_run():
+        a = tui::app::apply_events(taskapp::initial(), tui::input::decode_text("qdd"), 0):
+            on tui::app::Abort:
+                return false
+        a.finished?()
+    std::test::value("task app: apply_events stops at the finishing event", true, events_after_quit_are_ignored_by_run)
+
+    fn application_failure():
+        st = taskapp::initial().feed_event(tui::input::ctrl_char(120))
+        st.status
+    std::test::value("task app: Ctrl+X fails with the declared error Abort (handled by the test)", "Ctrl+X pressed: simulated application failure", application_failure)
+
+    fn resize_event():
+        st = taskapp::initial().feed_event(tui::input::resize(100, 30))
+        {status: st.status, page: st.list.page}
+    std::test::value("task app: a Resize event updates the status and the list page", {status: "Resized to 100x30", page: 21}, resize_event)
+
+fn reg_view():
+    fn first_frame():
+        taskapp::initial().lines(44, 13)
+    std::test::value("view: first frame at 44x13", [" Tasks: 3, done: 1                          ", "╭─ Tasks ──────────────────────────────────╮", "│> [x] Read the guide                      │", "│  [ ] Write a task app                    │", "│  [ ] Run it in a terminal                │", "│                                          │", "╰──────────────────────────────────────────╯", "┌─ Entry ──────────────────────────────────┐", "│New task:                                 │", "└──────────────────────────────────────────┘", "[ Add ]  Ctrl+C quits                       ", "Tab focus | Up/Down select | Space toggle | ", "Ready                                       "], first_frame)
+
+    fn editing_frame():
+        taskapp::initial().press(tui::input::Kind::Tab).feed("hi").lines(30, 9)
+    std::test::value("view: editing frame at 30x9 (the list box has no room left)", [" Tasks: 3, done: 1            ", "╭─ Tasks ────────────────────╮", "╰────────────────────────────╯", "┌─ Entry ────────────────────┐", "│New task: hi                │", "└────────────────────────────┘", "[ Add ]  Ctrl+C quits         ", "Tab focus | Up/Down select | S", "Ready                         "], editing_frame)
+
+    fn tiny_frame():
+        taskapp::initial().lines(20, 4)
+    std::test::value("view: tiny frame at 20x4 (fixed rows first, the flexible list gets nothing)", [" Tasks: 3, done: 1  ", "┌─ Entry ──────────┐", "│New task:         │", "└──────────────────┘"], tiny_frame)
+
+    fn zero_frame():
+        taskapp::initial().lines(0, 0)
+    std::test::value("view: zero frame", [], zero_frame)
+
+fn register_all():
+    reg_state()
+    reg_view()
+
+with context std::test::suite()
+register_all()
+std::test::report()

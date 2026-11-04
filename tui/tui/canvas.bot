@@ -1,0 +1,265 @@
+# tui::canvas -- geometry, drawing operations and the cell screen.
+#
+# A Canvas is an immutable list of drawing operations over a width x height
+# area; nothing is rasterised until `rasterize` is called.  Operations are applied
+# in order (painter's algorithm): a later operation overwrites an earlier one.
+# A Screen is the rasterised result, a row-major List of Cells, which is what
+# the ANSI renderer diffs and what tests inspect.
+#
+# Geometry rules (all total, nothing here ever panics):
+#   * Coordinates are Ints and may be negative or beyond the canvas: whatever
+#     falls outside the canvas (or outside an operation's clip rectangle) is
+#     clipped away cell by cell.
+#   * A Rect with w <= 0 or h <= 0 is empty: it has no visible area.
+#   * `new` clamps a negative size to 0 and a size above max_size to max_size.
+#   * A border needs w >= 2 and h >= 2; a smaller rectangle draws nothing.
+#   * Text is single-line: control characters (including newline) and
+#     characters outside the single-cell subset are drawn as U+FFFD
+#     (see tui::text).
+#   * A colour of -2 (tui::style::keep) keeps the colour already on the cell.
+
+import std::list
+import std::str
+import std::mutable_array
+import tui::style
+import tui::text
+
+max_size = 1000
+
+struct Rect:
+    x: int
+    y: int
+    w: int
+    h: int
+
+enum BorderKind:
+    Single,
+    Rounded,
+    Double,
+    Ascii,
+
+struct Cell:
+    ch: int
+    fg: int
+    bg: int
+    attrs: int
+
+struct Screen:
+    width: int
+    height: int
+    cells: List[Cell]
+
+private enum OpKind:
+    PutText,
+    PutFill,
+    PutBorder,
+
+opaque struct Op:
+    kind: OpKind
+    area: Rect
+    clip: Rect
+    cps: List[int]
+    style: tui::style::Style
+    border: BorderKind
+
+struct Canvas:
+    width: int
+    height: int
+    ops: List[Op]
+
+error OutOfBounds
+
+nomethod fn rect(x: int, y: int, w: int, h: int) -> Rect:
+    Rect {x: x, y: y, w: w, h: h}
+
+fn empty?(r: Rect) -> bool:
+    r.w <= 0 or r.h <= 0
+
+fn contains?(r: Rect, x: int, y: int) -> bool:
+    x >= r.x and y >= r.y and x < r.x + r.w and y < r.y + r.h
+
+private nomethod fn higher(a: int, b: int) -> int:
+    if a > b:
+        return a
+    b
+
+private nomethod fn lower(a: int, b: int) -> int:
+    if a < b:
+        return a
+    b
+
+# The overlap of two rectangles (an empty Rect at a's origin if they are apart).
+fn intersect(a: Rect, b: Rect) -> Rect:
+    x0 = higher(a.x, b.x)
+    y0 = higher(a.y, b.y)
+    x1 = lower(a.x + a.w, b.x + b.w)
+    y1 = lower(a.y + a.h, b.y + b.h)
+    if x1 <= x0 or y1 <= y0:
+        return Rect {x: a.x, y: a.y, w: 0, h: 0}
+    Rect {x: x0, y: y0, w: x1 - x0, h: y1 - y0}
+
+private fn clamp_size(n: int) -> int:
+    if n < 0:
+        return 0
+    if n > 1000:
+        return 1000
+    n
+
+fn valid_size?(width: int, height: int) -> bool:
+    width >= 0 and height >= 0 and width <= 1000 and height <= 1000
+
+fn blank_cell() -> Cell:
+    Cell {ch: 32, fg: -1, bg: -1, attrs: 0}
+
+nomethod fn new(width: int, height: int) -> Canvas:
+    Canvas {width: clamp_size(width), height: clamp_size(height), ops: []}
+
+fn bounds(c: Canvas) -> Rect:
+    Rect {x: 0, y: 0, w: c.width, h: c.height}
+
+private nomethod fn make_op(kind: OpKind, area: Rect, clip: Rect, cps: List[int], style: tui::style::Style, border: BorderKind) -> Op:
+    Op {kind: kind, area: area, clip: clip, cps: cps, style: style, border: border}
+
+# One text operation: S drawn at (x, y), clipped to CLIP.
+nomethod fn op_text(clip: Rect, x: int, y: int, s: str, style: tui::style::Style) -> Op:
+    cps = tui::text::codepoints(s)
+    make_op(OpKind::PutText, Rect {x: x, y: y, w: cps.length(), h: 1}, clip, cps, style, BorderKind::Single)
+
+# One fill operation: every cell of AREA becomes a space in STYLE.
+nomethod fn op_fill(clip: Rect, area: Rect, style: tui::style::Style) -> Op:
+    make_op(OpKind::PutFill, area, clip, [], style, BorderKind::Single)
+
+# One border operation: the outline of AREA.
+nomethod fn op_border(clip: Rect, area: Rect, kind: BorderKind, style: tui::style::Style) -> Op:
+    make_op(OpKind::PutBorder, area, clip, [], style, kind)
+
+fn add(c: Canvas, op: Op) -> Canvas:
+    Canvas {width: c.width, height: c.height, ops: c.ops.append(op)}
+
+# Several operations at once, in order (linear in the total, unlike repeated add).
+fn add_all(c: Canvas, ops: List[Op]) -> Canvas:
+    Canvas {width: c.width, height: c.height, ops: [c.ops, ops].flat()}
+
+fn text(c: Canvas, x: int, y: int, s: str, style: tui::style::Style) -> Canvas:
+    c.add(op_text(c.bounds(), x, y, s, style))
+
+fn text_in(c: Canvas, clip: Rect, x: int, y: int, s: str, style: tui::style::Style) -> Canvas:
+    c.add(op_text(c.bounds().intersect(clip), x, y, s, style))
+
+fn fill(c: Canvas, area: Rect, style: tui::style::Style) -> Canvas:
+    c.add(op_fill(c.bounds(), area, style))
+
+fn border(c: Canvas, area: Rect, kind: BorderKind, style: tui::style::Style) -> Canvas:
+    c.add(op_border(c.bounds(), area, kind, style))
+
+private nomethod fn pick_color(over: int, under: int) -> int:
+    if over == -2:
+        return under
+    over
+
+private fn put(place cells: MutableArray[Cell], width: int, height: int, clip: Rect, x: int, y: int, cp: int, style: tui::style::Style) -> unit:
+    if x < 0 or y < 0 or x >= width or y >= height:
+        return unit
+    if not clip.contains?(x, y):
+        return unit
+    i = y * width + x
+    old = cells.at(i):
+        on IndexNotFound:
+            return unit
+    cells.set(i, Cell {ch: cp, fg: pick_color(style.fg, old.fg), bg: pick_color(style.bg, old.bg), attrs: style.attrs}):
+        on IndexNotFound:
+            unit
+
+private fn paint_text(place cells: MutableArray[Cell], width: int, height: int, op: Op) -> unit:
+    if op.clip.empty?():
+        return unit
+    loop i from 0 to op.cps.length():
+        cells.put(width, height, op.clip, op.area.x + i, op.area.y, op.cps.get(i, 32), op.style)
+    unit
+
+private fn paint_fill(place cells: MutableArray[Cell], width: int, height: int, op: Op) -> unit:
+    area = op.area.intersect(op.clip)
+    loop y from area.y to area.y + area.h:
+        loop x from area.x to area.x + area.w:
+            cells.put(width, height, op.clip, x, y, 32, op.style)
+    unit
+
+private struct Glyphs:
+    tl: int
+    tr: int
+    bl: int
+    br: int
+    horizontal: int
+    vertical: int
+
+private fn glyphs(kind: BorderKind) -> Glyphs:
+    if kind == BorderKind::Rounded:
+        return Glyphs {tl: 9581, tr: 9582, bl: 9584, br: 9583, horizontal: 9472, vertical: 9474}
+    if kind == BorderKind::Double:
+        return Glyphs {tl: 9556, tr: 9559, bl: 9562, br: 9565, horizontal: 9552, vertical: 9553}
+    if kind == BorderKind::Ascii:
+        return Glyphs {tl: 43, tr: 43, bl: 43, br: 43, horizontal: 45, vertical: 124}
+    Glyphs {tl: 9484, tr: 9488, bl: 9492, br: 9496, horizontal: 9472, vertical: 9474}
+
+private fn paint_border(place cells: MutableArray[Cell], width: int, height: int, op: Op) -> unit:
+    a = op.area
+    if op.clip.empty?() or a.w < 2 or a.h < 2:
+        return unit
+    g = glyphs(op.border)
+    right = a.x + a.w - 1
+    bottom = a.y + a.h - 1
+    loop x from a.x + 1 to right:
+        cells.put(width, height, op.clip, x, a.y, g.horizontal, op.style)
+        cells.put(width, height, op.clip, x, bottom, g.horizontal, op.style)
+    loop y from a.y + 1 to bottom:
+        cells.put(width, height, op.clip, a.x, y, g.vertical, op.style)
+        cells.put(width, height, op.clip, right, y, g.vertical, op.style)
+    cells.put(width, height, op.clip, a.x, a.y, g.tl, op.style)
+    cells.put(width, height, op.clip, right, a.y, g.tr, op.style)
+    cells.put(width, height, op.clip, a.x, bottom, g.bl, op.style)
+    cells.put(width, height, op.clip, right, bottom, g.br, op.style)
+    unit
+
+private fn paint(place cells: MutableArray[Cell], width: int, height: int, op: Op) -> unit:
+    if op.kind == OpKind::PutText:
+        return cells.paint_text(width, height, op)
+    if op.kind == OpKind::PutFill:
+        return cells.paint_fill(width, height, op)
+    cells.paint_border(width, height, op)
+
+# A width x height screen of blank cells.
+fn blank(width: int, height: int) -> Screen:
+    w = clamp_size(width)
+    h = clamp_size(height)
+    cells = loop i from 0 to w * h:
+        blank_cell()
+    Screen {width: w, height: h, cells: cells}
+
+# Rasterise: apply every operation, in order, to a blank screen.
+fn rasterize(c: Canvas) -> Screen:
+    w = c.width
+    h = c.height
+    cells = std::mutable_array::create(w * h, blank_cell())
+    loop op in c.ops:
+        cells.paint(w, h, op)
+    Screen {width: w, height: h, cells: cells.freeze(cells.capacity())}
+
+fn cell_at(s: Screen, x: int, y: int) -> Cell errors OutOfBounds:
+    if x < 0 or y < 0 or x >= s.width or y >= s.height:
+        fail OutOfBounds
+    s.cells.at(y * s.width + x):
+        on IndexNotFound:
+            return blank_cell()
+
+# The text of row Y ("" outside the screen); control-free by construction.
+fn row_text(s: Screen, y: int) -> str:
+    if y < 0 or y >= s.height:
+        return ""
+    cps = loop x from 0 to s.width:
+        s.cells.get(y * s.width + x, blank_cell()).ch
+    tui::text::from_codepoints(cps)
+
+# Every row of the screen as plain text (no styling), top to bottom.
+fn lines(s: Screen) -> List[str]:
+    loop y from 0 to s.height:
+        s.row_text(y)

@@ -1,0 +1,29 @@
+import std::list
+import std::str
+import std::test
+import menu
+import tui::canvas
+import tui::input
+
+fn run_keys(start: menu::Menu, events: List[tui::input::Event]) -> menu::Menu:
+    fold e in events with intermediate m start:
+        m.update(e)
+
+fn reg():
+    fn picks_second_entry():
+        m = menu::initial().run_keys([tui::input::key(tui::input::Kind::Down), tui::input::key(tui::input::Kind::Enter)])
+        m.chosen
+    std::test::value("menu: Down then Enter chooses the second entry", "Load game", picks_second_entry)
+
+    fn rendering():
+        m = menu::initial().run_keys([tui::input::key(tui::input::Kind::Down), tui::input::key(tui::input::Kind::Down)])
+        m.view(20, 7).rasterize().lines()
+    std::test::value("menu: the view marks the selection", ["Main menu           ", "  New game          ", "  Load game         ", "> Options           ", "  Quit              ", "                    ", "Pick an entry       "], rendering)
+
+    fn quitting():
+        menu::initial().run_keys([tui::input::key(tui::input::Kind::End), tui::input::key(tui::input::Kind::Enter)]).finished?()
+    std::test::value("menu: choosing Quit finishes the application", true, quitting)
+
+with context std::test::suite()
+reg()
+std::test::report()

@@ -1,0 +1,254 @@
+# Pure tests: ANSI output as data, full vs incremental rendering.  No terminal.
+import std::list
+import std::str
+import std::mutable_array
+import std::test
+import tui::style
+import tui::text
+import tui::canvas
+import tui::ansi
+
+fn plain() -> tui::style::Style:
+    tui::style::plain()
+
+# ---------------------------------------------------------------------------
+# A miniature terminal that understands exactly the sequences tui::ansi emits
+# (CUP, ED 2, SGR, text), so that "what the user sees" can be compared.
+
+struct Em:
+    mode: int
+    params: str
+    x: int
+    y: int
+    fg: int
+    bg: int
+    attrs: int
+
+fn return_mode(em: Em, mode: int) -> Em:
+    Em {mode: mode, params: "", x: em.x, y: em.y, fg: em.fg, bg: em.bg, attrs: em.attrs}
+
+fn digits(s: str) -> List[int]:
+    cps = tui::text::raw_codepoints(s)
+    parts = fold cp in cps with intermediate acc {done: [], cur: 0}:
+        if cp == 59:
+            {done: [acc.done, [acc.cur]].flat(), cur: 0}
+        else:
+            {done: acc.done, cur: acc.cur * 10 + cp - 48}
+    [parts.done, [parts.cur]].flat()
+
+fn apply_sgr(em: Em, params: List[int]) -> Em:
+    first = fold i from 0 to params.length() with intermediate st {em: em, skip: 0}:
+        p = params.get(i, 0)
+        e = st.em
+        if st.skip > 0:
+            {em: e, skip: st.skip - 1}
+        elif p == 0:
+            {em: Em {mode: 0, params: "", x: e.x, y: e.y, fg: -1, bg: -1, attrs: 0}, skip: 0}
+        elif p == 1:
+            {em: Em {mode: 0, params: "", x: e.x, y: e.y, fg: e.fg, bg: e.bg, attrs: bit_or(e.attrs, 1)}, skip: 0}
+        elif p == 2:
+            {em: Em {mode: 0, params: "", x: e.x, y: e.y, fg: e.fg, bg: e.bg, attrs: bit_or(e.attrs, 2)}, skip: 0}
+        elif p == 3:
+            {em: Em {mode: 0, params: "", x: e.x, y: e.y, fg: e.fg, bg: e.bg, attrs: bit_or(e.attrs, 4)}, skip: 0}
+        elif p == 4:
+            {em: Em {mode: 0, params: "", x: e.x, y: e.y, fg: e.fg, bg: e.bg, attrs: bit_or(e.attrs, 8)}, skip: 0}
+        elif p == 7:
+            {em: Em {mode: 0, params: "", x: e.x, y: e.y, fg: e.fg, bg: e.bg, attrs: bit_or(e.attrs, 16)}, skip: 0}
+        elif p >= 30 and p <= 37:
+            {em: Em {mode: 0, params: "", x: e.x, y: e.y, fg: p - 30, bg: e.bg, attrs: e.attrs}, skip: 0}
+        elif p >= 90 and p <= 97:
+            {em: Em {mode: 0, params: "", x: e.x, y: e.y, fg: p - 82, bg: e.bg, attrs: e.attrs}, skip: 0}
+        elif p >= 40 and p <= 47:
+            {em: Em {mode: 0, params: "", x: e.x, y: e.y, fg: e.fg, bg: p - 40, attrs: e.attrs}, skip: 0}
+        elif p >= 100 and p <= 107:
+            {em: Em {mode: 0, params: "", x: e.x, y: e.y, fg: e.fg, bg: p - 92, attrs: e.attrs}, skip: 0}
+        elif p == 38:
+            {em: Em {mode: 0, params: "", x: e.x, y: e.y, fg: params.get(i + 2, 0), bg: e.bg, attrs: e.attrs}, skip: 2}
+        elif p == 48:
+            {em: Em {mode: 0, params: "", x: e.x, y: e.y, fg: e.fg, bg: params.get(i + 2, 0), attrs: e.attrs}, skip: 2}
+        else:
+            {em: e, skip: 0}
+    first.em
+
+# Replay OUT on a terminal that currently shows START.
+fn emulate(out: str, start: tui::canvas::Screen) -> tui::canvas::Screen:
+    width = start.width
+    height = start.height
+    cells = std::mutable_array::from_list(start.cells)
+    cps = tui::text::raw_codepoints(out)
+    fold cp in cps with intermediate em Em {mode: 0, params: "", x: 0, y: 0, fg: -1, bg: -1, attrs: 0}:
+        if em.mode == 1:
+            if cp == 91:
+                em.return_mode(2)
+            else:
+                em.return_mode(0)
+        elif em.mode == 2:
+            if cp >= 64 and cp <= 126:
+                nums = digits(em.params)
+                if cp == 72:
+                    Em {mode: 0, params: "", x: nums.get(1, 1) - 1, y: nums.get(0, 1) - 1, fg: em.fg, bg: em.bg, attrs: em.attrs}
+                elif cp == 74:
+                    loop i from 0 to cells.capacity():
+                        cells.set(i, tui::canvas::blank_cell()):
+                            on IndexNotFound:
+                                unit
+                    em.return_mode(0)
+                elif cp == 109:
+                    em.apply_sgr(nums)
+                else:
+                    em.return_mode(0)
+            else:
+                Em {mode: 2, params: em.params.append_code(cp), x: em.x, y: em.y, fg: em.fg, bg: em.bg, attrs: em.attrs}
+        elif cp == 27:
+            em.return_mode(1)
+        else:
+            if em.x >= 0 and em.y >= 0 and em.x < width and em.y < height:
+                cells.set(em.y * width + em.x, tui::canvas::Cell {ch: cp, fg: em.fg, bg: em.bg, attrs: em.attrs}):
+                    on IndexNotFound:
+                        unit
+            Em {mode: 0, params: "", x: em.x + 1, y: em.y, fg: em.fg, bg: em.bg, attrs: em.attrs}
+    tui::canvas::Screen {width: width, height: height, cells: cells.freeze(cells.capacity())}
+
+
+fn sample(width: int, height: int, seed: int) -> tui::canvas::Screen:
+    c = tui::canvas::new(width, height)
+    styled = c.text(1, 0, "Hello", plain().bold().with_fg(tui::style::red)).text(0, 1, "wörld", plain().with_bg(tui::style::blue).with_fg(tui::style::bright_yellow)).text(2, 2, "256 colour", plain().with_fg(200).with_bg(17).underline())
+    more = styled.border(tui::canvas::rect(0, 0, width, height), tui::canvas::BorderKind::Single, plain().dim())
+    if seed == 0:
+        return more.rasterize()
+    if seed == 1:
+        return more.text(3, 1, "CHG", plain().reverse()).rasterize()
+    if seed == 2:
+        return more.fill(tui::canvas::rect(1, 1, 8, 2), plain().with_bg(tui::style::green)).rasterize()
+    tui::canvas::new(width, height).text(0, 0, "different", plain().italic()).rasterize()
+
+fn count_escapes(s: str) -> int:
+    cps = tui::text::raw_codepoints(s)
+    fold cp in cps with intermediate n 0:
+        if cp == 27:
+            n + 1
+        else:
+            n
+
+fn vis(s: str) -> str:
+    tui::ansi::visible(s)
+
+fn reg_sequences():
+    fn cursor():
+        vis(tui::ansi::cursor_to(0, 0).concat(tui::ansi::cursor_to(79, 23)))
+    std::test::value("ansi: cursor positions are 1-based", "\\e[1;1H\\e[24;80H", cursor)
+
+    fn fixed():
+        vis(tui::ansi::enter_alternate_screen().concat(tui::ansi::hide_cursor()).concat(tui::ansi::show_cursor()).concat(tui::ansi::leave_alternate_screen()).concat(tui::ansi::clear_screen()).concat(tui::ansi::reset_style()))
+    std::test::value("ansi: fixed control sequences", "\\e[?1049h\\e[?25l\\e[?25h\\e[?1049l\\e[2J\\e[0m", fixed)
+
+    fn sgr_plain():
+        vis(tui::ansi::sgr(plain()))
+    std::test::value("ansi: plain style is a bare reset", "\\e[0m", sgr_plain)
+
+    fn sgr_attrs():
+        vis(tui::ansi::sgr(plain().bold().dim().italic().underline().reverse()))
+    std::test::value("ansi: every attribute", "\\e[0;1;2;3;4;7m", sgr_attrs)
+
+    fn sgr_colours():
+        vis(tui::ansi::sgr(plain().with_fg(tui::style::red).with_bg(tui::style::blue)))
+    std::test::value("ansi: standard colours", "\\e[0;31;44m", sgr_colours)
+
+    fn sgr_bright():
+        vis(tui::ansi::sgr(plain().with_fg(tui::style::bright_green).with_bg(tui::style::bright_white)))
+    std::test::value("ansi: bright colours", "\\e[0;92;107m", sgr_bright)
+
+    fn sgr_256():
+        vis(tui::ansi::sgr(plain().with_fg(200).with_bg(17)))
+    std::test::value("ansi: 256-colour palette", "\\e[0;38;5;200;48;5;17m", sgr_256)
+
+    fn sgr_keep_is_default():
+        vis(tui::ansi::sgr(tui::style::transparent()))
+    std::test::value("ansi: an unresolved transparent colour never leaks into output", "\\e[0m", sgr_keep_is_default)
+
+fn reg_render():
+    fn blank_full():
+        vis(tui::ansi::full(tui::canvas::blank(3, 2)))
+    std::test::value("render: a full redraw of a blank screen is just reset + clear", "\\e[0m\\e[2J", blank_full)
+
+    fn one_cell_full():
+        vis(tui::ansi::full(tui::canvas::new(4, 1).text(2, 0, "xy", plain()).rasterize()))
+    std::test::value("render: a full redraw draws only what is not blank", "\\e[0m\\e[2J\\e[1;3H\\e[0mxy\\e[0m", one_cell_full)
+
+    fn unchanged():
+        a = sample(20, 5, 0)
+        a.diff(a)
+    std::test::value("render: an unchanged screen produces no output at all", "", unchanged)
+
+    fn one_cell_diff():
+        a = tui::canvas::new(5, 2).text(0, 0, "abcde", plain()).rasterize()
+        b = tui::canvas::new(5, 2).text(0, 0, "abXde", plain()).rasterize()
+        vis(a.diff(b))
+    std::test::value("render: one changed cell is one cursor move, one character", "\\e[1;3H\\e[0mX\\e[0m", one_cell_diff)
+
+    fn two_runs():
+        a = tui::canvas::new(8, 1).text(0, 0, "abcdefgh", plain()).rasterize()
+        b = tui::canvas::new(8, 1).text(0, 0, "XbcdefgY", plain()).rasterize()
+        vis(a.diff(b))
+    std::test::value("render: separate changes are separate runs", "\\e[1;1H\\e[0mX\\e[1;8H\\e[0mY\\e[0m", two_runs)
+
+    fn style_runs():
+        a = tui::canvas::new(4, 1).text(0, 0, "abcd", plain()).rasterize()
+        b = tui::canvas::new(4, 1).text(0, 0, "ab", plain().bold()).text(2, 0, "cc", plain().with_fg(tui::style::green)).rasterize()
+        vis(a.diff(b))
+    std::test::value("render: a style change starts a new run with its own reset", "\\e[1;1H\\e[0;1mab\\e[1;3H\\e[0;32mcc\\e[0m", style_runs)
+
+    fn style_does_not_leak():
+        a = tui::canvas::blank(3, 1)
+        b = tui::canvas::new(3, 1).text(0, 0, "ab", plain().reverse()).rasterize()
+        out = vis(a.diff(b))
+        out
+    std::test::value("render: output ends by resetting the style", "\\e[1;1H\\e[0;7mab\\e[0m", style_does_not_leak)
+
+    fn resized_is_full():
+        a = tui::canvas::new(3, 1).text(0, 0, "abc", plain()).rasterize()
+        b = tui::canvas::new(4, 1).text(0, 0, "abc", plain()).rasterize()
+        a.diff(b) == tui::ansi::full(b)
+    std::test::value("render: a size change is a full redraw", true, resized_is_full)
+
+    fn zero_sized():
+        z = tui::canvas::blank(0, 0)
+        {full: vis(tui::ansi::full(z)), diff: z.diff(z)}
+    std::test::value("render: zero-sized screens render without error", {full: "\\e[0m\\e[2J", diff: ""}, zero_sized)
+
+    fn deterministic():
+        a = sample(30, 6, 0)
+        b = sample(30, 6, 1)
+        a.diff(b) == a.diff(b) and tui::ansi::full(b) == tui::ansi::full(b)
+    std::test::value("render: identical inputs give identical bytes", true, deterministic)
+
+    fn no_control_from_text():
+        hostile = tui::canvas::new(10, 1).text(0, 0, "ab".concat(tui::text::char_string(27)).concat("[2Jb\n"), plain()).rasterize()
+        benign = tui::canvas::new(10, 1).text(0, 0, "ab?[2Jb?", plain()).rasterize()
+        {hostile: count_escapes(tui::ansi::full(hostile)), same_as_benign: count_escapes(tui::ansi::full(benign))}
+    std::test::value("render: application text cannot add escape characters to the output", {hostile: 5, same_as_benign: 5}, no_control_from_text)
+
+    fn full_equals_incremental():
+        results = loop seed from 0 to 4:
+            fold other from 0 to 4 with intermediate ok true:
+                before = sample(30, 8, seed)
+                after = sample(30, 8, other)
+                via_diff = before.diff(after).emulate(before)
+                via_full = tui::ansi::full(after).emulate(tui::canvas::blank(30, 8))
+                ok and via_diff == after and via_full == after
+        fold r in results with intermediate all true:
+            all and r
+    std::test::value("render: incremental updates and a full redraw show the same screen (16 transitions, replayed on a terminal model)", true, full_equals_incremental)
+
+    fn full_equals_diff_from_blank():
+        after = sample(30, 8, 2)
+        tui::canvas::blank(30, 8).diff(after).emulate(tui::canvas::blank(30, 8)) == tui::ansi::full(after).emulate(tui::canvas::blank(30, 8))
+    std::test::value("render: diff from a blank screen shows what a full redraw shows", true, full_equals_diff_from_blank)
+
+fn register_all():
+    reg_sequences()
+    reg_render()
+
+with context std::test::suite()
+register_all()
+std::test::report()

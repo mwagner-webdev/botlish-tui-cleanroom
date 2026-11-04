@@ -1,0 +1,358 @@
+# tui::input -- the pure, incremental decoder from terminal bytes to events.
+#
+# Nothing here touches a terminal.  Feed the decoder whatever chunk of bytes a
+# read returned (one byte, half an escape sequence, a hundred keystrokes) and
+# it returns the events that are complete plus its new state.
+#
+# Escape policy.  A lone ESC byte is ambiguous: it is the Escape key, or the
+# start of a sequence (arrow keys, Alt+key).  The decoder therefore HOLDS a
+# pending ESC (Decoder.pending is not empty) until the next byte arrives.  The
+# caller decides when the silence is long enough: it calls `flush`, which
+# resolves a pending lone ESC as the Escape key (tui::session does this after
+# 50 ms without input).  `decode_all` flushes at the end of its input.
+#
+# Malformed input never panics and never grows without bound: an unknown or
+# malformed control sequence becomes a Kind::Unknown event; a sequence longer
+# than max_sequence - 1 bytes (31) becomes one Unknown event and its remaining
+# parameter bytes are discarded up to the final byte; a malformed UTF-8
+# sequence becomes U+FFFD.  A byte that interrupts a pending sequence (such as
+# a new ESC) is processed normally after the Unknown event.
+#
+# Modifier decoding follows xterm: in "ESC [ 1 ; M X" the value M - 1 is a bit
+# set, 1 = Shift, 2 = Alt, 4 = Ctrl.
+
+import std::list
+import std::str
+import std::mutable_vector
+import tui::text
+
+max_sequence = 32
+
+enum Kind:
+    Char,
+    Enter,
+    Tab,
+    BackTab,
+    Backspace,
+    Delete,
+    Escape,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Insert,
+    Function,
+    Resize,
+    Unknown,
+
+# One input event.  ch is the scalar value of a Char (and the number 1..12 of
+# a Function key); width/height are the new size of a Resize.
+struct Event:
+    kind: Kind
+    ch: int
+    ctrl: bool
+    alt: bool
+    shift: bool
+    width: int
+    height: int
+
+struct Decoder:
+    pending: List[int]
+    skipping: bool
+
+struct Decoded:
+    decoder: Decoder
+    events: List[Event]
+
+fn key(kind: Kind) -> Event:
+    Event {kind: kind, ch: 0, ctrl: false, alt: false, shift: false, width: 0, height: 0}
+
+fn char_event(cp: int) -> Event:
+    Event {kind: Kind::Char, ch: cp, ctrl: false, alt: false, shift: false, width: 0, height: 0}
+
+fn ctrl_char(cp: int) -> Event:
+    Event {kind: Kind::Char, ch: cp, ctrl: true, alt: false, shift: false, width: 0, height: 0}
+
+fn function_key(n: int) -> Event:
+    Event {kind: Kind::Function, ch: n, ctrl: false, alt: false, shift: false, width: 0, height: 0}
+
+nomethod fn resize(width: int, height: int) -> Event:
+    Event {kind: Kind::Resize, ch: 0, ctrl: false, alt: false, shift: false, width: width, height: height}
+
+private fn with_modifier_bits(event: Event, bits: int) -> Event:
+    Event {kind: event.kind, ch: event.ch, ctrl: bit_and(bits, 4) != 0, alt: bit_and(bits, 2) != 0, shift: bit_and(bits, 1) != 0, width: event.width, height: event.height}
+
+fn with_ctrl(event: Event) -> Event:
+    Event {kind: event.kind, ch: event.ch, ctrl: true, alt: event.alt, shift: event.shift, width: event.width, height: event.height}
+
+fn with_alt(event: Event) -> Event:
+    Event {kind: event.kind, ch: event.ch, ctrl: event.ctrl, alt: true, shift: event.shift, width: event.width, height: event.height}
+
+fn with_shift(event: Event) -> Event:
+    Event {kind: event.kind, ch: event.ch, ctrl: event.ctrl, alt: event.alt, shift: true, width: event.width, height: event.height}
+
+# True for the plain printable character CH (no Ctrl, no Alt): is_char?(e, 113) is the key q.
+fn is_char?(event: Event, ch: int) -> bool:
+    event.kind == Kind::Char and event.ch == ch and not event.ctrl and not event.alt
+
+# True for Ctrl plus the letter CH (given as the lower-case scalar value).
+fn is_ctrl?(event: Event, ch: int) -> bool:
+    event.kind == Kind::Char and event.ch == ch and event.ctrl
+
+# True for a key of this kind without Ctrl or Alt.
+fn is_key?(event: Event, kind: Kind) -> bool:
+    event.kind == kind and not event.ctrl and not event.alt
+
+fn new_decoder() -> Decoder:
+    Decoder {pending: [], skipping: false}
+
+# True while a partial sequence is held (the caller should flush on silence).
+fn pending?(decoder: Decoder) -> bool:
+    decoder.pending.length() > 0
+
+private nomethod fn emit(decoder: Decoder, events: List[Event]) -> Decoded:
+    Decoded {decoder: decoder, events: events}
+
+private nomethod fn hold(pending: List[int]) -> Decoded:
+    Decoded {decoder: Decoder {pending: pending, skipping: false}, events: []}
+
+private fn idle() -> Decoder:
+    Decoder {pending: [], skipping: false}
+
+private nomethod fn with_events(first: List[Event], rest: Decoded) -> Decoded:
+    Decoded {decoder: rest.decoder, events: [first, rest.events].flat()}
+
+# Handling of one byte when no sequence is pending.
+private fn start(b: int) -> Decoded:
+    if b == 27:
+        return hold([27])
+    if b == 13:
+        return emit(idle(), [key(Kind::Enter)])
+    if b == 9:
+        return emit(idle(), [key(Kind::Tab)])
+    if b == 127 or b == 8:
+        return emit(idle(), [key(Kind::Backspace)])
+    if b == 0:
+        return emit(idle(), [ctrl_char(32)])
+    if b < 27:
+        return emit(idle(), [ctrl_char(b + 96)])
+    if b < 32:
+        return emit(idle(), [ctrl_char(b + 64)])
+    if b < 127:
+        return emit(idle(), [char_event(b)])
+    if b >= 194 and b <= 244:
+        return hold([b])
+    emit(idle(), [char_event(65533)])
+
+private fn utf8_length(lead: int) -> int:
+    if lead < 224:
+        return 2
+    if lead < 240:
+        return 3
+    4
+
+private fn continuation(bs: List[int], k: int) -> int:
+    bit_and(bs.get(k, 0), 63)
+
+private fn utf8_value(bs: List[int]) -> int:
+    b0 = bs.get(0, 0)
+    if bs.length() == 2:
+        return bit_or(bit_and(b0, 31).shift_left(6), bs.continuation(1))
+    if bs.length() == 3:
+        return bit_or(bit_or(bit_and(b0, 15).shift_left(12), bs.continuation(1).shift_left(6)), bs.continuation(2))
+    top = bit_or(bit_and(b0, 7).shift_left(18), bs.continuation(1).shift_left(12))
+    bit_or(top, bit_or(bs.continuation(2).shift_left(6), bs.continuation(3)))
+
+private fn valid_scalar?(cp: int, length: int) -> bool:
+    if length == 2:
+        return cp >= 128
+    if length == 3:
+        return cp >= 2048 and not (cp >= 55296 and cp < 57344)
+    cp >= 65536 and cp <= 1114111
+
+private fn utf8_complete(bs: List[int]) -> Decoded:
+    cp = utf8_value(bs)
+    if cp.valid_scalar?(bs.length()):
+        return emit(idle(), [char_event(cp)])
+    emit(idle(), [char_event(65533)])
+
+# Parse the numbers of a CSI parameter string ("1;5" -> [1, 5]).  ok is false
+# if it holds anything but digits and ';'.
+private struct Params:
+    numbers: List[int]
+    current: int
+    seen: bool
+    ok: bool
+
+private fn param_step(p: Params, b: int) -> Params:
+    if b == 59:
+        return Params {numbers: [p.numbers, [p.current]].flat(), current: 0, seen: false, ok: p.ok}
+    if b >= 48 and b <= 57:
+        return Params {numbers: p.numbers, current: p.current * 10 + b - 48, seen: true, ok: p.ok}
+    Params {numbers: p.numbers, current: p.current, seen: p.seen, ok: false}
+
+private fn parse_params(bytes: List[int]) -> Params:
+    p = fold b in bytes with intermediate acc Params {numbers: [], current: 0, seen: false, ok: true}:
+        acc.param_step(b)
+    if p.seen:
+        return Params {numbers: [p.numbers, [p.current]].flat(), current: 0, seen: false, ok: p.ok}
+    p
+
+private fn arrow_kind(final: int) -> Kind:
+    if final == 65:
+        return Kind::Up
+    if final == 66:
+        return Kind::Down
+    if final == 67:
+        return Kind::Right
+    if final == 68:
+        return Kind::Left
+    if final == 72:
+        return Kind::Home
+    if final == 70:
+        return Kind::End
+    if final == 90:
+        return Kind::BackTab
+    Kind::Unknown
+
+private fn tilde_event(n: int) -> Event:
+    if n == 1 or n == 7:
+        return key(Kind::Home)
+    if n == 2:
+        return key(Kind::Insert)
+    if n == 3:
+        return key(Kind::Delete)
+    if n == 4 or n == 8:
+        return key(Kind::End)
+    if n == 5:
+        return key(Kind::PageUp)
+    if n == 6:
+        return key(Kind::PageDown)
+    if n >= 11 and n <= 15:
+        return function_key(n - 10)
+    if n >= 17 and n <= 21:
+        return function_key(n - 11)
+    if n == 23 or n == 24:
+        return function_key(n - 12)
+    key(Kind::Unknown)
+
+# The event for a complete CSI sequence: ESC [ PARAMS FINAL.
+private fn csi_event(params: List[int], final: int) -> Event:
+    p = parse_params(params)
+    if not p.ok:
+        return key(Kind::Unknown)
+    modifier = p.numbers.get(1, 1) - 1
+    if final == 126:
+        return tilde_event(p.numbers.get(0, 0)).with_modifier_bits(modifier)
+    if final >= 80 and final <= 83:
+        return function_key(final - 79).with_modifier_bits(modifier)
+    key(arrow_kind(final)).with_modifier_bits(modifier)
+
+private fn ss3_event(final: int) -> Event:
+    if final >= 80 and final <= 83:
+        return function_key(final - 79)
+    kind = arrow_kind(final)
+    if kind == Kind::BackTab:
+        return key(Kind::Unknown)
+    key(kind)
+
+# One more byte B for a pending sequence that starts with ESC.
+private fn escape_step(pending: List[int], b: int) -> Decoded:
+    n = pending.length()
+    if n == 1:
+        if b == 91 or b == 79:
+            return hold([27, b])
+        if b == 27:
+            return Decoded {decoder: Decoder {pending: [27], skipping: false}, events: [key(Kind::Escape)]}
+        if b >= 32 and b <= 126:
+            return emit(idle(), [char_event(b).with_alt()])
+        if b == 127:
+            return emit(idle(), [key(Kind::Backspace).with_alt()])
+        if b == 13:
+            return emit(idle(), [key(Kind::Enter).with_alt()])
+        if b == 9:
+            return emit(idle(), [key(Kind::Tab).with_alt()])
+        return with_events([key(Kind::Escape)], start(b))
+    if pending.get(1, 0) == 79:
+        if b >= 32 and b <= 126:
+            return emit(idle(), [ss3_event(b)])
+        return with_events([key(Kind::Unknown)], start(b))
+    if b >= 32 and b <= 63:
+        if n + 1 >= max_sequence:
+            return emit(Decoder {pending: [], skipping: true}, [key(Kind::Unknown)])
+        return hold([pending, [b]].flat())
+    if b >= 64 and b <= 126:
+        params = loop i from 2 to n:
+            pending.get(i, 0)
+        return emit(idle(), [params.csi_event(b)])
+    with_events([key(Kind::Unknown)], start(b))
+
+private fn utf8_step(pending: List[int], b: int) -> Decoded:
+    if b >= 128 and b < 192:
+        grown = [pending, [b]].flat()
+        if grown.length() == utf8_length(pending.get(0, 0)):
+            return utf8_complete(grown)
+        return hold(grown)
+    with_events([char_event(65533)], start(b))
+
+# Feed one byte to the decoder.
+private fn step(decoder: Decoder, b: int) -> Decoded:
+    if decoder.skipping:
+        if b >= 32 and b <= 63:
+            return emit(decoder, [])
+        if b >= 64 and b <= 126:
+            return emit(idle(), [])
+        return idle().step(b)
+    if decoder.pending.length() == 0:
+        return start(b)
+    if decoder.pending.get(0, 0) == 27:
+        return decoder.pending.escape_step(b)
+    decoder.pending.utf8_step(b)
+
+# Feed a chunk of bytes (values 0..255, any chunking).  Complete events come
+# back in order; an incomplete sequence stays in the returned decoder.
+fn feed(decoder: Decoder, bytes: List[int]) -> Decoded:
+    out = std::mutable_vector::from_list([key(Kind::Unknown)])
+    out.clear()
+    final = fold b in bytes with intermediate d decoder:
+        r = d.step(b)
+        loop e in r.events:
+            out.push(e)
+        r.decoder
+    events = loop e in out:
+        e
+    Decoded {decoder: final, events: events}
+
+# Resolve whatever is pending as if no more bytes were coming (the Escape
+# timeout, or end of input): a lone ESC is the Escape key, ESC [ and ESC O
+# are Alt+[ and Alt+O, other incomplete sequences are Unknown, an incomplete
+# UTF-8 sequence is U+FFFD.
+fn flush(decoder: Decoder) -> Decoded:
+    p = decoder.pending
+    if p.length() == 0:
+        return emit(idle(), [])
+    if p.get(0, 0) != 27:
+        return emit(idle(), [char_event(65533)])
+    if p.length() == 1:
+        return emit(idle(), [key(Kind::Escape)])
+    if p.length() == 2 and (p.get(1, 0) == 91 or p.get(1, 0) == 79):
+        return emit(idle(), [char_event(p.get(1, 0)).with_alt()])
+    emit(idle(), [key(Kind::Unknown)])
+
+# All events of a complete byte string (feed, then flush).
+fn decode_all(bytes: List[int]) -> List[Event]:
+    r = new_decoder().feed(bytes)
+    f = flush(r.decoder)
+    [r.events, f.events].flat()
+
+# All events of a String's UTF-8 bytes (ESC characters in the text start
+# escape sequences: build them with tui::ansi::esc()).
+fn decode_text(text: str) -> List[Event]:
+    bs = text.encode_utf8()
+    ints = loop i from 0 to bs.length():
+        tui::text::widen(bs.at(i))
+    decode_all(ints)

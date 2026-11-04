@@ -1,0 +1,16 @@
+# hello -- the smallest useful program: describe a layout, draw it, look at it.
+#
+#   botlish hello.bot                  (works on every backend: no terminal)
+import tui::style
+import tui::canvas
+import tui::layout
+import tui::widgets
+
+fn view(width: int, height: int) -> tui::canvas::Canvas:
+    plain = tui::style::plain()
+    body = tui::layout::vstack([tui::layout::label("Hello from the tui package", plain.bold()), tui::layout::label("Layouts are values; the size is data.", plain)])
+    ui = tui::layout::vstack([tui::widgets::status_bar(" hello ", plain), body.boxed("demo", tui::canvas::BorderKind::Rounded, plain).with_flex(1)])
+    tui::canvas::new(width, height).draw(ui)
+
+# The program's value is printed by the compiler: here, the screen as text lines.
+view(40, 6).rasterize().lines()

@@ -1,0 +1,183 @@
+direct module
+import std::abi
+import std::abi::bytes
+import std::abi::x86_64
+import std::linux::abi::x86_64
+import std::binary
+import std::byte
+import std::int
+import std::str
+import std::list
+
+layout Termios:
+    size 36
+    align 4
+    field iflag: std::binary::U32 at 0
+    field oflag: std::binary::U32 at 4
+    field cflag: std::binary::U32 at 8
+    field lflag: std::binary::U32 at 12
+    field line: std::binary::U8 at 16
+    field cc: array 19 of std::binary::U8 at 17
+
+layout WinSize:
+    size 8
+    align 2
+    field rows: std::binary::U16 at 0
+    field cols: std::binary::U16 at 2
+    field xpix: std::binary::U16 at 4
+    field ypix: std::binary::U16 at 6
+
+layout PollSet:
+    size 16
+    align 4
+    field fd0: std::binary::I32 at 0
+    field ev0: std::binary::I16 at 4
+    field rev0: std::binary::I16 at 6
+    field fd1: std::binary::I32 at 8
+    field ev1: std::binary::I16 at 12
+    field rev1: std::binary::I16 at 14
+
+layout SigSet:
+    size 8
+    align 8
+    field mask: std::binary::U64 at 0
+
+layout InBuf:
+    size 64
+    align 1
+    field b: array 64 of std::binary::U8 at 0
+
+struct Sys:
+    rc: int
+    data: std::abi::bytes::MutableBytes
+
+fn word(n: int) -> std::abi::x86_64::Register64:
+    std::abi::x86_64::register64(n):
+        on std::abi::x86_64::Register64BelowRange:
+            std::abi::x86_64::register64(0)
+        on std::abi::x86_64::Register64AboveRange:
+            std::abi::x86_64::register64(0)
+
+fn sys_buf(nr: int, a: int, b: int, buf: std::abi::bytes::MutableBytes, c: int) -> Sys:
+    d = std::abi::bytes::detach(buf)
+    rc = std::linux::abi::x86_64::syscall({rax: word(nr), rdi: word(a), rsi: word(b), rdx: word(c), r10: std::abi::x86_64::from_mutable_bytes(d)})
+    Sys {rc: std::abi::x86_64::to_int(rc), data: d}
+
+# generic: buffer in rsi
+fn sys_rsi(nr: int, a: int, buf: std::abi::bytes::MutableBytes, c: int, e: int) -> Sys:
+    d = std::abi::bytes::detach(buf)
+    rc = std::linux::abi::x86_64::syscall({rax: word(nr), rdi: word(a), rsi: std::abi::x86_64::from_mutable_bytes(d), rdx: word(c), r10: word(e)})
+    Sys {rc: std::abi::x86_64::to_int(rc), data: d}
+
+fn sys_rdx(nr: int, a: int, b: int, buf: std::abi::bytes::MutableBytes) -> Sys:
+    d = std::abi::bytes::detach(buf)
+    rc = std::linux::abi::x86_64::syscall({rax: word(nr), rdi: word(a), rsi: word(b), rdx: std::abi::x86_64::from_mutable_bytes(d)})
+    Sys {rc: std::abi::x86_64::to_int(rc), data: d}
+
+fn mb(n: int) -> std::abi::bytes::MutableBytes:
+    u = std::abi::usize(n):
+        on std::abi::AbiIntegerBelowRange:
+            std::abi::usize(0)
+        on std::abi::AbiIntegerAboveRange:
+            std::abi::usize(0)
+    std::abi::bytes::zeroed(u)
+
+fn sys_poll(buf: std::abi::bytes::MutableBytes, n: int, timeout: int) -> Sys:
+    d = std::abi::bytes::detach(buf)
+    rc = std::linux::abi::x86_64::syscall({rax: word(7), rdi: std::abi::x86_64::from_mutable_bytes(d), rsi: word(n), rdx: word(timeout)})
+    Sys {rc: std::abi::x86_64::to_int(rc), data: d}
+
+fn sigprocmask_block(set: std::abi::bytes::MutableBytes) -> int:
+    d = std::abi::bytes::detach(set)
+    rc = std::linux::abi::x86_64::syscall({rax: word(14), rdi: word(0), rsi: std::abi::x86_64::from_mutable_bytes(d), rdx: word(0), r10: word(8)})
+    std::abi::x86_64::to_int(rc)
+
+fn signalfd(set: std::abi::bytes::MutableBytes) -> int:
+    d = std::abi::bytes::detach(set)
+    rc = std::linux::abi::x86_64::syscall({rax: word(289), rdi: word(-1), rsi: std::abi::x86_64::from_mutable_bytes(d), rdx: word(8), r10: word(0)})
+    std::abi::x86_64::to_int(rc)
+
+fn read_fd(fd: int, buf: std::abi::bytes::MutableBytes) -> Sys:
+    d = std::abi::bytes::detach(buf)
+    rc = std::linux::abi::x86_64::syscall({rax: word(0), rdi: word(fd), rsi: std::abi::x86_64::from_mutable_bytes(d), rdx: word(std::abi::bytes::mutable_length(d).value)})
+    Sys {rc: std::abi::x86_64::to_int(rc), data: d}
+
+fn say(s: str) -> int:
+    d = std::abi::bytes::from_list(s.encode_utf8())
+    rc = std::linux::abi::x86_64::syscall({rax: word(1), rdi: word(1), rsi: std::abi::x86_64::from_bytes(d), rdx: word(std::abi::bytes::length(d).value)})
+    std::abi::x86_64::to_int(rc)
+
+fn winsize() -> str:
+    r = sys_rdx(16, 1, 21523, mb(8))
+    w = std::binary::parse(WinSize, std::abi::bytes::freeze(r.data)):
+        on LayoutLengthMismatch:
+            LayoutStruct[WinSize] {rows: 0, cols: 0, xpix: 0, ypix: 0}
+    std::int::to_string(r.rc).concat(" ").concat(std::int::to_string(w.rows)).concat("x").concat(std::int::to_string(w.cols))
+
+
+fn hexlist(xs, n: int) -> str:
+    parts = loop i from 0 to n:
+        std::int::to_string(xs.get(i, 0))
+    fold p in parts with intermediate acc "":
+        acc.concat(p).append_char(',')
+
+fn tcget() -> Sys:
+    sys_rdx(16, 0, 21505, mb(36))
+
+fn tcset(buf: std::abi::bytes::MutableBytes) -> Sys:
+    sys_rdx(16, 0, 21506, buf)
+
+fn rawmode(orig: LayoutStruct[Termios]) -> LayoutStruct[Termios]:
+    LayoutStruct[Termios] {iflag: 0, oflag: orig.oflag, cflag: orig.cflag, lflag: 0, line: orig.line, cc: orig.cc}
+
+fn loopstep(sigfd: std::abi::I32, n: int) -> int:
+    ps = std::binary::emit(LayoutStruct[PollSet] {fd0: 0, ev0: 1, rev0: 0, fd1: sigfd.value, ev1: 1, rev1: 0})
+    r = sys_poll(std::abi::bytes::from_bytes(ps), 2, 5000)
+    out = std::binary::parse(PollSet, std::abi::bytes::freeze(r.data)):
+        on LayoutLengthMismatch:
+            LayoutStruct[PollSet] {fd0: 0, ev0: 0, rev0: 0, fd1: 0, ev1: 0, rev1: 0}
+    say("poll rc=".concat(std::int::to_string(r.rc)).append_char(' ').concat(std::int::to_string(out.rev0)).append_char(' ').concat(std::int::to_string(out.rev1)).append_char('\r').append_char('\n'))
+    if r.rc == 0:
+        return 0
+    if out.rev1 != 0:
+        sr = read_fd(sigfd.value, mb(128))
+        say("SIGWINCH ".concat(winsize()).append_char('\r').append_char('\n'))
+        return loopstep(sigfd, n + 1)
+    if out.rev0 != 0:
+        ir = read_fd(0, mb(64))
+        inb = std::binary::parse(InBuf, std::abi::bytes::freeze(ir.data)):
+            on LayoutLengthMismatch:
+                LayoutStruct[InBuf] {b: []}
+        say("keys ".concat(hexlist(inb.b, ir.rc)).append_char('\r').append_char('\n'))
+        if inb.b.get(0, 0) == 113:
+            return 1
+    loopstep(sigfd, n + 1)
+
+say(winsize().append_char('\n'))
+sigset = std::binary::emit(LayoutStruct[SigSet] {mask: 134217728})
+bl = sigprocmask_block(std::abi::bytes::from_bytes(sigset))
+sfdn = signalfd(std::abi::bytes::from_bytes(sigset))
+sfd = std::abi::i32(sfdn):
+    on std::abi::AbiIntegerBelowRange:
+        std::abi::i32(0)
+    on std::abi::AbiIntegerAboveRange:
+        std::abi::i32(0)
+say("block=".concat(std::int::to_string(bl)).concat(" sfd=").concat(std::int::to_string(sfdn)).append_char('\n'))
+orig = tcget()
+ot = std::binary::parse(Termios, std::abi::bytes::freeze(orig.data)):
+    on LayoutLengthMismatch:
+        LayoutStruct[Termios] {iflag: 0, oflag: 0, cflag: 0, lflag: 0, line: 0, cc: []}
+say("tcget=".concat(std::int::to_string(orig.rc)).append_char(' ').concat(std::int::to_string(ot.lflag)).append_char('\n'))
+raw = rawmode(ot)
+rawb = std::binary::emit(raw):
+    on LayoutExtentMismatch:
+        std::abi::bytes::from_list([])
+tcs = tcset(std::abi::bytes::from_bytes(rawb))
+say("tcset=".concat(std::int::to_string(tcs.rc)).append_char('\r').append_char('\n'))
+res = loopstep(sfd, 0)
+otb = std::binary::emit(ot):
+    on LayoutExtentMismatch:
+        std::abi::bytes::from_list([])
+back = tcset(std::abi::bytes::from_bytes(otb))
+say("restored=".concat(std::int::to_string(back.rc)).append_char('\n'))
+res

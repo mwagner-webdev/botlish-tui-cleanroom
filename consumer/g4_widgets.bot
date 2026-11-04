@@ -1,0 +1,26 @@
+# GUIDE 4: widgets are states plus pure functions.
+import tui::style
+import tui::canvas
+import tui::input
+import tui::layout
+import tui::widgets
+
+plain = tui::style::plain()
+
+fn press(l: tui::widgets::ListState, kind: tui::input::Kind) -> tui::widgets::ListState:
+    l.list_update(tui::input::key(kind))
+
+# A selection list: state + event -> next state.
+list0 = tui::widgets::list_state(["alpha", "beta", "gamma"])
+list1 = list0.press(tui::input::Kind::Down).press(tui::input::Kind::Down)
+
+# A text field: fold decoded events into it.
+fn typed(text: str) -> tui::widgets::TextInput:
+    fold e in tui::input::decode_text(text) with intermediate field tui::widgets::text_input(""):
+        field.input_update(e)
+
+field = typed("tui")
+
+# state + options -> node -> canvas
+ui = tui::layout::vstack([list1.list_node(3, true, plain, plain.reverse()), field.input_node(10, true, plain), tui::widgets::button("OK", false, plain)])
+{selected: list1.selected_item(), text: field.input_text(), screen: tui::canvas::new(12, 5).draw(ui).rasterize().lines()}

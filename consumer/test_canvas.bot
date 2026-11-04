@@ -1,0 +1,231 @@
+# Pure tests: text policy, geometry, clipping, canvas drawing.  No terminal.
+#   botlish -backend interp test_canvas.bot       (any backend)
+import std::list
+import std::str
+import std::test
+import tui::style
+import tui::text
+import tui::canvas
+
+fn esc() -> str:
+    tui::text::char_string(27)
+
+fn plain() -> tui::style::Style:
+    tui::style::plain()
+
+fn lines_of(width: int, height: int, c: tui::canvas::Canvas) -> List[str]:
+    c.rasterize().lines()
+
+# The character at (x, y) of S, or -1 when the read fails with OutOfBounds.
+fn char_at(s: tui::canvas::Screen, x: int, y: int) -> int:
+    c = s.cell_at(x, y):
+        on tui::canvas::OutOfBounds:
+            return -1
+    c.ch
+
+fn reg_text():
+    fn width_ascii():
+        tui::text::width("hello")
+    std::test::value("text: width of ASCII", 5, width_ascii)
+
+    fn width_latin():
+        tui::text::width("héllo wörld")
+    std::test::value("text: accented Latin letters are one cell each", 11, width_latin)
+
+    fn width_empty():
+        tui::text::width("")
+    std::test::value("text: empty string has width 0", 0, width_empty)
+
+    fn escape_is_neutralised():
+        tui::text::sanitize("ab".concat(esc()).concat("[31mb"))
+    std::test::value("text: ESC inside text becomes U+FFFD, never a control sequence", "ab�[31mb", escape_is_neutralised)
+
+    fn controls_are_neutralised():
+        tui::text::codepoints("a\nb\tc".concat(tui::text::char_string(127)).concat(tui::text::char_string(155)))
+    std::test::value("text: newline, tab, DEL and C1 controls become U+FFFD", [97, 65533, 98, 65533, 99, 65533, 65533], controls_are_neutralised)
+
+    fn wide_is_replaced():
+        tui::text::sanitize("x世y")
+    std::test::value("text: a wide (CJK) character is replaced, not mis-measured", "x�y", wide_is_replaced)
+
+    fn combining_is_replaced():
+        tui::text::sanitize("é")
+    std::test::value("text: a combining mark is replaced", "e�", combining_is_replaced)
+
+    fn astral_is_one_replacement():
+        tui::text::codepoints("😀😀")
+    std::test::value("text: each emoji is a single replacement cell", [65533, 65533], astral_is_one_replacement)
+
+    fn nbsp():
+        tui::text::codepoints("a b")
+    std::test::value("text: no-break space is shown as a space", [97, 32, 98], nbsp)
+
+    fn box_drawing():
+        tui::text::width("─│┌")
+    std::test::value("text: box drawing characters are single cell", 3, box_drawing)
+
+    fn roundtrip():
+        tui::text::from_codepoints(tui::text::codepoints("héllo ─ wörld"))
+    std::test::value("text: codepoints/from_codepoints round trip", "héllo ─ wörld", roundtrip)
+
+    fn code_of():
+        tui::text::code('q')
+    std::test::value("text: code of a character literal", 113, code_of)
+
+fn reg_geometry():
+    fn zero_screen():
+        lines_of(0, 0, tui::canvas::new(0, 0).text(0, 0, "abc", plain()))
+    std::test::value("canvas: a 0x0 screen is empty and drawing on it is harmless", [], zero_screen)
+
+    fn zero_width():
+        lines_of(0, 3, tui::canvas::new(0, 3).text(0, 1, "abc", plain()))
+    std::test::value("canvas: zero width gives empty rows", ["", "", ""], zero_width)
+
+    fn negative_size() -> List[int]:
+        c = tui::canvas::new(-5, -1)
+        [c.width, c.height]
+    std::test::value("canvas: negative sizes clamp to zero", [0, 0], negative_size)
+
+    fn huge_size():
+        c = tui::canvas::new(5000, 1001)
+        {width: c.width, height: c.height, big_ok: tui::canvas::valid_size?(5000, 1), small_ok: tui::canvas::valid_size?(80, 24)}
+    std::test::value("canvas: sizes clamp to max_size; valid_size? says so", {width: 1000, height: 1000, big_ok: false, small_ok: true}, huge_size)
+
+    fn text_placement():
+        lines_of(8, 3, tui::canvas::new(8, 3).text(2, 1, "hi", plain()))
+    std::test::value("canvas: text is placed at (x, y)", ["        ", "  hi    ", "        "], text_placement)
+
+    fn clip_right():
+        lines_of(5, 1, tui::canvas::new(5, 1).text(3, 0, "abcdef", plain()))
+    std::test::value("canvas: text running past the right edge is clipped", ["   ab"], clip_right)
+
+    fn clip_left():
+        lines_of(5, 1, tui::canvas::new(5, 1).text(-2, 0, "abcdef", plain()))
+    std::test::value("canvas: negative x clips the left part of the text", ["cdef "], clip_left)
+
+    fn clip_below():
+        lines_of(4, 2, tui::canvas::new(4, 2).text(0, 2, "xx", plain()).text(0, 5, "yy", plain()).text(0, -1, "zz", plain()))
+    std::test::value("canvas: rows below the bottom and above the top are dropped", ["    ", "    "], clip_below)
+
+    fn far_outside():
+        lines_of(4, 1, tui::canvas::new(4, 1).text(1000000, 0, "xx", plain()).text(-1000000, 0, "yy", plain()))
+    std::test::value("canvas: huge coordinates are clipped without trouble", ["    "], far_outside)
+
+    fn empty_text():
+        lines_of(3, 1, tui::canvas::new(3, 1).text(1, 0, "", plain()))
+    std::test::value("canvas: an empty string draws nothing", ["   "], empty_text)
+
+    fn overlap():
+        lines_of(6, 1, tui::canvas::new(6, 1).text(0, 0, "aaaaaa", plain()).text(2, 0, "bb", plain()))
+    std::test::value("canvas: later operations overwrite earlier ones", ["aabbaa"], overlap)
+
+    fn text_in_clip():
+        lines_of(8, 1, tui::canvas::new(8, 1).text_in(tui::canvas::rect(2, 0, 3, 1), 0, 0, "abcdefgh", plain()))
+    std::test::value("canvas: text_in clips to the given rectangle", ["  cde   "], text_in_clip)
+
+    fn control_in_text():
+        lines_of(5, 1, tui::canvas::new(5, 1).text(0, 0, "a\nb", plain()))
+    std::test::value("canvas: a newline in text is a replacement character, not a line break", ["a�b  "], control_in_text)
+
+    fn fill_region():
+        lines_of(5, 3, tui::canvas::new(5, 3).text(0, 0, "xxxxx", plain()).text(0, 1, "xxxxx", plain()).fill(tui::canvas::rect(1, 0, 3, 2), plain()))
+    std::test::value("canvas: fill clears a region", ["x   x", "x   x", "     "], fill_region)
+
+    fn fill_empty_rect():
+        lines_of(3, 1, tui::canvas::new(3, 1).text(0, 0, "abc", plain()).fill(tui::canvas::rect(0, 0, 0, 1), plain()).fill(tui::canvas::rect(0, 0, 3, -2), plain()))
+    std::test::value("canvas: rectangles with no area change nothing", ["abc"], fill_empty_rect)
+
+    fn fill_outside():
+        lines_of(3, 1, tui::canvas::new(3, 1).text(0, 0, "abc", plain()).fill(tui::canvas::rect(-9, -9, 100, 100), plain()))
+    std::test::value("canvas: a fill larger than the canvas is clipped to it", ["   "], fill_outside)
+
+    fn rect_intersect():
+        r = tui::canvas::rect(0, 0, 5, 5).intersect(tui::canvas::rect(3, 3, 5, 5))
+        a = tui::canvas::rect(0, 0, 2, 2).intersect(tui::canvas::rect(5, 5, 2, 2))
+        {overlap: r, disjoint_empty: a.empty?()}
+    std::test::value("canvas: Rect intersection; disjoint rectangles are empty", {overlap: tui::canvas::Rect {x: 3, y: 3, w: 2, h: 2}, disjoint_empty: true}, rect_intersect)
+
+fn reg_borders():
+    fn single():
+        lines_of(5, 3, tui::canvas::new(5, 3).border(tui::canvas::rect(0, 0, 5, 3), tui::canvas::BorderKind::Single, plain()))
+    std::test::value("border: single", ["┌───┐", "│   │", "└───┘"], single)
+
+    fn rounded():
+        lines_of(4, 2, tui::canvas::new(4, 2).border(tui::canvas::rect(0, 0, 4, 2), tui::canvas::BorderKind::Rounded, plain()))
+    std::test::value("border: rounded", ["╭──╮", "╰──╯"], rounded)
+
+    fn double_line():
+        lines_of(3, 3, tui::canvas::new(3, 3).border(tui::canvas::rect(0, 0, 3, 3), tui::canvas::BorderKind::Double, plain()))
+    std::test::value("border: double", ["╔═╗", "║ ║", "╚═╝"], double_line)
+
+    fn ascii():
+        lines_of(4, 3, tui::canvas::new(4, 3).border(tui::canvas::rect(0, 0, 4, 3), tui::canvas::BorderKind::Ascii, plain()))
+    std::test::value("border: ascii", ["+--+", "|  |", "+--+"], ascii)
+
+    fn too_small():
+        lines_of(3, 3, tui::canvas::new(3, 3).border(tui::canvas::rect(0, 0, 1, 3), tui::canvas::BorderKind::Ascii, plain()).border(tui::canvas::rect(0, 0, 3, 1), tui::canvas::BorderKind::Ascii, plain()))
+    std::test::value("border: a rectangle thinner than 2 draws nothing", ["   ", "   ", "   "], too_small)
+
+    fn partly_outside():
+        lines_of(4, 3, tui::canvas::new(4, 3).border(tui::canvas::rect(2, 1, 6, 6), tui::canvas::BorderKind::Ascii, plain()))
+    std::test::value("border: a border partly off-screen is clipped cell by cell", ["    ", "  +-", "  | "], partly_outside)
+
+    fn negative_origin():
+        lines_of(4, 3, tui::canvas::new(4, 3).border(tui::canvas::rect(-1, -1, 4, 3), tui::canvas::BorderKind::Ascii, plain()))
+    std::test::value("border: negative origin", ["  | ", "--+ ", "    "], negative_origin)
+
+fn reg_cells():
+    fn cell_text() -> List[int]:
+        s = tui::canvas::new(3, 1).text(0, 0, "ab", plain().bold().with_fg(tui::style::red)).rasterize()
+        c = s.cell_at(1, 0):
+            on tui::canvas::OutOfBounds:
+                tui::canvas::blank_cell()
+        [c.ch, c.fg, c.bg, c.attrs]
+    std::test::value("cells: a drawn cell carries character and style", [98, 1, -1, 1], cell_text)
+
+    fn cell_outside() -> List[int]:
+        s = tui::canvas::new(3, 1).rasterize()
+        [s.char_at(3, 0), s.char_at(0, -1), s.char_at(2, 0)]
+    std::test::value("cells: reading outside the screen is the declared error OutOfBounds", [-1, -1, 32], cell_outside)
+
+    fn keep_colour() -> List[int]:
+        under = plain().with_bg(tui::style::blue).with_fg(tui::style::yellow)
+        s = tui::canvas::new(2, 1).fill(tui::canvas::rect(0, 0, 2, 1), under).text(0, 0, "ab", tui::style::transparent()).rasterize()
+        c = s.cell_at(0, 0):
+            on tui::canvas::OutOfBounds:
+                tui::canvas::blank_cell()
+        [c.ch, c.fg, c.bg]
+    std::test::value("cells: a transparent colour keeps the colour underneath", [97, 3, 4], keep_colour)
+
+    fn invalid_colour():
+        tui::style::plain().with_fg(300).with_bg(-7)
+    std::test::value("style: an out-of-range colour is the default colour", tui::style::Style {fg: -1, bg: -1, attrs: 0}, invalid_colour)
+
+    fn attrs():
+        s = plain().bold().reverse().underline()
+        {bits: s.attrs, bold: s.has_attr?(1), dim: s.has_attr?(2), reverse: s.has_attr?(16)}
+    std::test::value("style: attributes combine as bits", {bits: 25, bold: true, dim: false, reverse: true}, attrs)
+
+    fn screens_equal():
+        a = tui::canvas::new(4, 2).text(0, 0, "abcd", plain()).rasterize()
+        b = tui::canvas::new(4, 2).text(0, 0, "ab", plain()).text(2, 0, "cd", plain()).rasterize()
+        a == b
+    std::test::value("screens: equal drawings give equal screens", true, screens_equal)
+
+    fn batch_matches_single():
+        base = tui::canvas::new(6, 1)
+        one = base.text(0, 0, "ab", plain()).text(2, 0, "cd", plain()).rasterize()
+        ops = [tui::canvas::op_text(base.bounds(), 0, 0, "ab", plain()), tui::canvas::op_text(base.bounds(), 2, 0, "cd", plain())]
+        two = base.add_all(ops).rasterize()
+        one == two
+    std::test::value("canvas: add_all equals repeated add", true, batch_matches_single)
+
+fn register_all():
+    reg_text()
+    reg_geometry()
+    reg_borders()
+    reg_cells()
+
+with context std::test::suite()
+register_all()
+std::test::report()

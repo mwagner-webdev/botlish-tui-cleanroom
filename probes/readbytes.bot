@@ -1,0 +1,37 @@
+import std::io
+import std::int
+import std::list
+import std::abi
+import std::abi::bytes
+import std::binary
+import std::linux::io
+
+layout Chunk:
+    size 64
+    align 1
+    field data: array 64 of std::binary::U8 at 0
+
+fn show(n: int, context io: std::linux::io::LinuxIO) -> unit:
+    buf = std::abi::bytes::zeroed(std::abi::usize(64))
+    r = std::linux::io::read(buf)
+    frozen = std::abi::bytes::freeze(r.data)
+    parsed = std::binary::parse(Chunk, frozen):
+        on LayoutLengthMismatch:
+            return unit
+    xs = parsed.data
+    shown = loop i from 0 to r.result:
+        xs.at(i):
+            on IndexNotFound:
+                0
+    text = std::int::to_string(r.result)
+    std::io::print_line(text):
+        on std::io::WriteFailed:
+            unit
+    loop x in shown:
+        std::io::print_line(std::int::to_string(x)):
+            on std::io::WriteFailed:
+                unit
+    unit
+
+with context std::linux::io::create()
+show(0)

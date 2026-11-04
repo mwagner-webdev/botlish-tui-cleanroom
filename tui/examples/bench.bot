@@ -1,0 +1,130 @@
+# bench -- representative pure-library workloads (no terminal).
+#
+#   botlish -emit-native-executable bench.bot       builds ./bench
+#   time ./bench WORKLOAD REPEAT [SCALE]            e.g.  time ./bench 1 200 2
+#
+#   1  render an 80x24 screen: layout -> canvas -> screen -> full ANSI redraw
+#      (SCALE multiplies the width, height and number of rows: 2 = 160x48)
+#   2  render a screen of deeply nested layouts (boxes inside stacks, 8 levels)
+#   3  update a small portion of an unchanged screen: view + rasterise + diff
+#   4  decode a stream of 10 000 key events (arrows, text, UTF-8, Escape); SCALE multiplies it
+#   5  apply 58 widget state transitions per repeat (28 text edits, 30 list moves)
+#
+# There is no clock in the standard library, so time the whole process with
+# `time` and compare with REPEAT = 0 (start-up cost).
+import std::io
+import std::linux::io
+import std::list
+import std::str
+import std::int
+import tui::style
+import tui::text
+import tui::canvas
+import tui::layout
+import tui::ansi
+import tui::input
+import tui::widgets
+
+fn plain() -> tui::style::Style:
+    tui::style::plain()
+
+fn row(i: int, selected: int) -> tui::layout::Node:
+    st = if i == selected:
+        plain().reverse()
+    else:
+        plain()
+    tui::layout::hstack([tui::layout::label("item ".concat(std::int::to_string(i)), st).with_width(12), tui::layout::label("some description text for row ".concat(std::int::to_string(i)), plain().dim()), tui::layout::spacer(), tui::layout::label("[x]", plain())])
+
+fn screen_ui(selected: int, status: str, scale: int) -> tui::layout::Node:
+    rows = loop i from 0 to 20 * scale:
+        i.row(selected)
+    tui::layout::vstack([tui::widgets::status_bar(" benchmark ", plain().bold()), tui::layout::vstack(rows).boxed("rows", tui::canvas::BorderKind::Rounded, plain()).with_flex(1), tui::widgets::status_bar(status, plain())])
+
+fn render_once(selected: int, scale: int) -> tui::canvas::Screen:
+    tui::canvas::new(80 * scale, 24 * scale).draw(selected.screen_ui("status", scale)).rasterize()
+
+fn nested_ui(depth: int, text: str) -> tui::layout::Node:
+    if depth == 0:
+        return tui::layout::label(text, plain())
+    inner = nested_ui(depth - 1, text)
+    side = tui::layout::label("depth ".concat(std::int::to_string(depth)), plain().dim())
+    stack = tui::layout::hstack([side, tui::layout::vstack([inner, tui::layout::spacer()]).with_flex(1)])
+    stack.boxed("", tui::canvas::BorderKind::Single, plain()).with_flex(1)
+
+fn workload_render(n: int, scale: int) -> int:
+    sizes = loop i from 0 to n:
+        r = i.mod(20).render_once(scale)
+        tui::ansi::full(r).length()
+    sizes.length()
+
+fn workload_nested(n: int, scale: int) -> int:
+    sizes = loop i from 0 to n:
+        r = tui::canvas::new(80 * scale, 24 * scale).draw(nested_ui(8, "leaf")).rasterize()
+        tui::ansi::full(r).length()
+    sizes.length()
+
+fn workload_diff(n: int, scale: int) -> int:
+    base = render_once(3, scale)
+    sizes = loop i from 0 to n:
+        next = tui::canvas::new(80 * scale, 24 * scale).draw(3.screen_ui("status ".concat(std::int::to_string(i)), scale)).rasterize()
+        base.diff(next).length()
+    fold s in sizes with intermediate total 0:
+        total + s
+
+fn stream(n: int) -> List[int]:
+    chunk = [97, 27, 91, 65, 98, 27, 91, 49, 59, 53, 67, 195, 169, 13, 27, 79, 80, 120, 127, 9]
+    pieces = loop i from 0 to n:
+        chunk
+    pieces.flat()
+
+fn workload_decode(n: int, scale: int) -> int:
+    bytes = stream(1000 * scale)
+    counts = loop i from 0 to n:
+        tui::input::decode_all(bytes).length()
+    fold c in counts with intermediate total 0:
+        total + c
+
+fn workload_widgets(n: int) -> int:
+    typing = tui::input::decode_text("hello world, this is text")
+    events = [typing, [tui::input::key(tui::input::Kind::Left), tui::input::key(tui::input::Kind::Backspace), tui::input::key(tui::input::Kind::Home)]].flat()
+    names = loop i from 0 to 200:
+        "task ".concat(std::int::to_string(i))
+    results = loop i from 0 to n:
+        t = fold e in events with intermediate acc tui::widgets::text_input(""):
+            acc.input_update(e)
+        l = fold k from 0 to 30 with intermediate acc tui::widgets::list_state(names):
+            acc.list_update(tui::input::key(tui::input::Kind::Down))
+        t.cursor + l.selected
+    fold r in results with intermediate total 0:
+        total + r
+
+fn run(which: int, repeat: int, scale: int) -> int:
+    if which == 1:
+        return repeat.workload_render(scale)
+    if which == 2:
+        return repeat.workload_nested(scale)
+    if which == 3:
+        return repeat.workload_diff(scale)
+    if which == 4:
+        return repeat.workload_decode(scale)
+    workload_widgets(repeat)
+
+fn number(text: str, fallback: int) -> int:
+    std::int::from_string(text):
+        on InvalidIntegerText:
+            fallback
+
+fn main() -> int:
+    args = argv():
+        on InvalidArgumentEncoding:
+            return -1
+    which = args.get(1, "").number(1)
+    repeat = args.get(2, "").number(1)
+    scale = args.get(3, "").number(1)
+    which.run(repeat, scale)
+
+with context std::linux::io::create()
+result = main()
+std::io::print_line("workload result ".concat(std::int::to_string(result))):
+    on std::io::WriteFailed:
+        unit

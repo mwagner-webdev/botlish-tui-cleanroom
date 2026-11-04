@@ -1,0 +1,14 @@
+# Valid-looking code rejected: a generic struct whose Fn field mentions its type slot
+# cannot be passed to a function taking App[S].
+struct App[S]:
+    initial: S
+    update: Fn{args: [S, int], return: S}
+
+fn run(app: App[S]) -> S:
+    app.update(app.initial, 1)
+
+fn upd(s: int, e: int) -> int:
+    s + e
+
+app = App {initial: 0, update: upd}
+run(app)

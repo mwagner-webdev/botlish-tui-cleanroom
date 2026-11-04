@@ -1,0 +1,271 @@
+# tui::widgets -- widget state and rendering, as plain values and functions.
+#
+# Every widget is a small immutable struct (its state) plus two kinds of
+# functions:
+#     update:  state + Event  ->  next state          (pure, no terminal)
+#     node:    state + options -> a tui::layout Node  (pure, no terminal)
+# There is no widget registry, no hidden mutable state and no callbacks: the
+# application keeps the states in its own state struct and decides which
+# widget receives an event (see Focus).
+#
+#   Focus      which of N controls has the keyboard; Tab / Shift+Tab move it
+#   button     a labelled action; activated? recognises Enter and Space
+#   TextInput  single-line editor (insert, Backspace, Delete, arrows, Home,
+#              End, Ctrl+A, Ctrl+E, Ctrl+U, Ctrl+K); the caret is drawn as a
+#              reverse-video cell
+#   ListState  scrollable selection list (Up, Down, Home, End, PageUp, PageDown)
+#   status_bar a full-width reverse-video line
+
+import std::list
+import std::str
+import tui::style
+import tui::text
+import tui::input
+import tui::layout
+import tui::canvas
+
+private fn clamp(n: int, low: int, high: int) -> int:
+    if n < low:
+        return low
+    if n > high:
+        return high
+    n
+
+# ---------------------------------------------------------------- Focus
+
+struct Focus:
+    index: int
+    count: int
+
+# Focus on control 0 of COUNT controls (COUNT < 1 is treated as 1).
+fn focus(count: int) -> Focus:
+    if count < 1:
+        return Focus {index: 0, count: 1}
+    Focus {index: 0, count: count}
+
+fn focus_next(f: Focus) -> Focus:
+    Focus {index: (f.index + 1).mod(f.count), count: f.count}
+
+fn focus_prev(f: Focus) -> Focus:
+    Focus {index: (f.index + f.count - 1).mod(f.count), count: f.count}
+
+fn focus_set(f: Focus, index: int) -> Focus:
+    Focus {index: index.clamp(0, f.count - 1), count: f.count}
+
+fn focused?(f: Focus, index: int) -> bool:
+    f.index == index
+
+# Tab moves to the next control, Shift+Tab to the previous; any other event
+# leaves the focus unchanged.
+fn focus_update(f: Focus, event: tui::input::Event) -> Focus:
+    if event.kind == tui::input::Kind::Tab:
+        return f.focus_next()
+    if event.kind == tui::input::Kind::BackTab:
+        return f.focus_prev()
+    f
+
+# ---------------------------------------------------------------- Button
+
+# True for the events that activate a focused button: Enter or Space.
+fn activated?(event: tui::input::Event) -> bool:
+    event.is_key?(tui::input::Kind::Enter) or event.is_char?(32)
+
+# "[ LABEL ]"; reverse video when focused.
+nomethod fn button(label: str, focused: bool, style: tui::style::Style) -> tui::layout::Node:
+    face = "[ ".concat(label).concat(" ]")
+    if focused:
+        return tui::layout::label(face, style.reverse())
+    tui::layout::label(face, style)
+
+# A full-width line of reverse-video text (it flexes to the width it is given).
+nomethod fn status_bar(text: str, style: tui::style::Style) -> tui::layout::Node:
+    bar = style.reverse()
+    tui::layout::label(text, bar).on_color(bar).with_height(1)
+
+# ---------------------------------------------------------------- TextInput
+
+# The text is held as displayed code points (see tui::text); cursor is the
+# insertion index, 0..length.  max_length <= 0 means unlimited.
+struct TextInput:
+    cps: List[int]
+    cursor: int
+    max_length: int
+
+private fn slice(cps: List[int], from: int, to: int) -> List[int]:
+    loop i from from to to:
+        cps.get(i, 32)
+
+fn text_input(text: str) -> TextInput:
+    cps = tui::text::codepoints(text)
+    TextInput {cps: cps, cursor: cps.length(), max_length: 0}
+
+fn with_max_length(t: TextInput, max_length: int) -> TextInput:
+    TextInput {cps: t.cps, cursor: t.cursor, max_length: max_length}
+
+fn input_text(t: TextInput) -> str:
+    tui::text::from_codepoints(t.cps)
+
+fn input_empty?(t: TextInput) -> bool:
+    t.cps.length() == 0
+
+private fn input_with(t: TextInput, cps: List[int], cursor: int) -> TextInput:
+    TextInput {cps: cps, cursor: cursor.clamp(0, cps.length()), max_length: t.max_length}
+
+private fn input_insert(t: TextInput, cp: int) -> TextInput:
+    if t.max_length > 0 and t.cps.length() >= t.max_length:
+        return t
+    shown = tui::text::displayed(cp)
+    cps = [t.cps.slice(0, t.cursor), [shown], t.cps.slice(t.cursor, t.cps.length())].flat()
+    t.input_with(cps, t.cursor + 1)
+
+private fn input_delete_before(t: TextInput) -> TextInput:
+    if t.cursor <= 0:
+        return t
+    t.input_with([t.cps.slice(0, t.cursor - 1), t.cps.slice(t.cursor, t.cps.length())].flat(), t.cursor - 1)
+
+private fn input_delete_at(t: TextInput) -> TextInput:
+    if t.cursor >= t.cps.length():
+        return t
+    t.input_with([t.cps.slice(0, t.cursor), t.cps.slice(t.cursor + 1, t.cps.length())].flat(), t.cursor)
+
+private fn input_ctrl(t: TextInput, ch: int) -> TextInput:
+    if ch == 97:
+        return t.input_with(t.cps, 0)
+    if ch == 101:
+        return t.input_with(t.cps, t.cps.length())
+    if ch == 117:
+        return t.input_with(t.cps.slice(t.cursor, t.cps.length()), 0)
+    if ch == 107:
+        return t.input_with(t.cps.slice(0, t.cursor), t.cursor)
+    t
+
+# Apply an event to the editor.  Unrelated events (Tab, Enter, Escape, Alt+key,
+# ...) are ignored: the application decides what they mean.
+fn input_update(t: TextInput, event: tui::input::Event) -> TextInput:
+    if event.kind == tui::input::Kind::Char and event.ctrl:
+        return t.input_ctrl(event.ch)
+    if event.kind == tui::input::Kind::Char and not event.alt:
+        return t.input_insert(event.ch)
+    if event.kind == tui::input::Kind::Backspace:
+        return t.input_delete_before()
+    if event.kind == tui::input::Kind::Delete:
+        return t.input_delete_at()
+    if event.kind == tui::input::Kind::Left:
+        return t.input_with(t.cps, t.cursor - 1)
+    if event.kind == tui::input::Kind::Right:
+        return t.input_with(t.cps, t.cursor + 1)
+    if event.kind == tui::input::Kind::Home:
+        return t.input_with(t.cps, 0)
+    if event.kind == tui::input::Kind::End:
+        return t.input_with(t.cps, t.cps.length())
+    t
+
+# The editor as a node WIDTH cells wide.  The visible window scrolls to keep
+# the caret inside; the caret (shown only when FOCUSED) is a reverse-video cell.
+fn input_node(t: TextInput, width: int, focused: bool, style: tui::style::Style) -> tui::layout::Node:
+    w = if width < 1:
+        1
+    else:
+        width
+    n = t.cps.length()
+    start = if t.cursor >= w:
+        t.cursor - w + 1
+    else:
+        0
+    stop = if start + w < n:
+        start + w
+    else:
+        n
+    if not focused:
+        shown = tui::text::from_codepoints(t.cps.slice(start, stop))
+        return tui::layout::label(shown, style).with_width(w)
+    before = tui::text::from_codepoints(t.cps.slice(start, t.cursor))
+    caret = tui::text::from_codepoints([t.cps.get(t.cursor, 32)])
+    after = tui::text::from_codepoints(t.cps.slice(t.cursor + 1, stop))
+    tui::layout::hstack([tui::layout::label(before, style), tui::layout::label(caret, style.reverse()), tui::layout::label(after, style)]).with_width(w)
+
+# ---------------------------------------------------------------- ListState
+
+# A selection list.  selected is -1 only for an empty list; offset is the
+# index of the first visible row as of the last update; page is the number of
+# rows PageUp/PageDown move (set it to the visible height).
+struct ListState:
+    items: List[str]
+    selected: int
+    offset: int
+    page: int
+
+fn list_state(items: List[str]) -> ListState:
+    if items.length() == 0:
+        return ListState {items: items, selected: -1, offset: 0, page: 10}
+    ListState {items: items, selected: 0, offset: 0, page: 10}
+
+fn with_page(l: ListState, page: int) -> ListState:
+    ListState {items: l.items, selected: l.selected, offset: l.offset, page: page.clamp(1, 1000)}
+
+# Select item INDEX (clamped into the list), scrolling just enough to keep it
+# within one page of rows.
+fn list_select(l: ListState, index: int) -> ListState:
+    if l.items.length() == 0:
+        return ListState {items: l.items, selected: -1, offset: 0, page: l.page}
+    i = index.clamp(0, l.items.length() - 1)
+    top = if i < l.offset:
+        i
+    elif i >= l.offset + l.page:
+        i - l.page + 1
+    else:
+        l.offset
+    ListState {items: l.items, selected: i, offset: top, page: l.page}
+
+# Replace the items, keeping the selection index where possible.
+fn list_replace(l: ListState, items: List[str]) -> ListState:
+    ListState {items: items, selected: l.selected, offset: l.offset, page: l.page}.list_select(l.selected)
+
+fn selected_item(l: ListState) -> str:
+    l.items.get(l.selected, "")
+
+private fn list_key(l: ListState, kind: tui::input::Kind) -> ListState:
+    if kind == tui::input::Kind::Up:
+        return l.list_select(l.selected - 1)
+    if kind == tui::input::Kind::Down:
+        return l.list_select(l.selected + 1)
+    if kind == tui::input::Kind::Home:
+        return l.list_select(0)
+    if kind == tui::input::Kind::End:
+        return l.list_select(l.items.length() - 1)
+    if kind == tui::input::Kind::PageUp:
+        return l.list_select(l.selected - l.page)
+    if kind == tui::input::Kind::PageDown:
+        return l.list_select(l.selected + l.page)
+    l
+
+# Up/Down/Home/End/PageUp/PageDown move the selection (keys with Ctrl or Alt
+# are ignored).
+fn list_update(l: ListState, event: tui::input::Event) -> ListState:
+    if event.ctrl or event.alt:
+        return l
+    l.list_key(event.kind)
+
+# The list as a node HEIGHT rows tall: a marker column ("> " on the selected
+# row), the row text, the selected row highlighted with HIGHLIGHT (a full-width
+# bar) when FOCUSED and with reverse-less bold otherwise.
+fn list_node(l: ListState, height: int, focused: bool, style: tui::style::Style, highlight: tui::style::Style) -> tui::layout::Node:
+    h = height.clamp(0, 1000)
+    first_row = l.offset.clamp(l.selected - h + 1, l.selected)
+    start = if first_row < 0:
+        0
+    else:
+        first_row
+    rows = loop i from start to start + h:
+        if i >= l.items.length():
+            continue
+        text = l.items.get(i, "")
+        if i == l.selected:
+            bar = if focused:
+                highlight
+            else:
+                style.bold()
+            tui::layout::label("> ".concat(text), bar).on_color(bar).with_height(1)
+        else:
+            tui::layout::label("  ".concat(text), style)
+    tui::layout::vstack(rows).with_height(h)

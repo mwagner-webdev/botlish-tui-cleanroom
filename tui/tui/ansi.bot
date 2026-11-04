@@ -1,0 +1,148 @@
+# tui::ansi -- trusted ANSI output: control sequences, full and incremental
+# rendering of a Screen.
+#
+# Everything this module emits is either a fixed control sequence built here
+# or the text of Screen cells; cells only ever hold single-cell code points
+# (tui::text), so application text can never smuggle in a control sequence.
+#
+# Rendering is deterministic and stateless between frames: every drawn run
+# starts with its own cursor move and its own full SGR reset ("ESC[0;...m"),
+# and a non-empty update ends with "ESC[0m", so styles never leak into
+# unrelated content.
+
+import std::list
+import std::str
+import std::int
+import tui::text
+import tui::style
+import tui::canvas
+
+fn esc() -> str:
+    tui::text::char_string(27)
+
+# ESC [ BODY
+fn csi(body: str) -> str:
+    esc().append_char('[').concat(body)
+
+private fn number(n: int) -> str:
+    std::int::to_string(n)
+
+# Move the cursor to column X, row Y (both 0-based).
+nomethod fn cursor_to(x: int, y: int) -> str:
+    csi(number(y + 1).append_char(';').concat(number(x + 1)).append_char('H'))
+
+fn hide_cursor() -> str:
+    csi("?25l")
+
+fn show_cursor() -> str:
+    csi("?25h")
+
+fn enter_alternate_screen() -> str:
+    csi("?1049h")
+
+fn leave_alternate_screen() -> str:
+    csi("?1049l")
+
+fn disable_wrap() -> str:
+    csi("?7l")
+
+fn enable_wrap() -> str:
+    csi("?7h")
+
+fn clear_screen() -> str:
+    csi("2J")
+
+fn reset_style() -> str:
+    csi("0m")
+
+private fn prepend_semicolon(s: str) -> str:
+    "".append_char(';').concat(s)
+
+private fn color_code(color: int, base: int, bright_base: int, extended: int) -> str:
+    if color < 0 or color > 255:
+        return ""
+    if color < 8:
+        return number(base + color).prepend_semicolon()
+    if color < 16:
+        return number(bright_base + color - 8).prepend_semicolon()
+    number(extended).concat(";5;").concat(number(color)).prepend_semicolon()
+
+private fn attr_code(style: tui::style::Style, bit: int, code: int) -> str:
+    if style.has_attr?(bit):
+        return number(code).prepend_semicolon()
+    ""
+
+# The SGR sequence that selects STYLE from a reset state: "ESC[0;..m".
+fn sgr(style: tui::style::Style) -> str:
+    codes = "".append_char('0').concat(style.attr_code(1, 1)).concat(style.attr_code(2, 2)).concat(style.attr_code(4, 3)).concat(style.attr_code(8, 4)).concat(style.attr_code(16, 7))
+    csi(codes.concat(style.fg.color_code(30, 90, 38)).concat(style.bg.color_code(40, 100, 48)).append_char('m'))
+
+private fn cell_style(cell: tui::canvas::Cell) -> tui::style::Style:
+    tui::style::Style {fg: cell.fg, bg: cell.bg, attrs: cell.attrs}
+
+private fn concat_all(parts: List[str]) -> str:
+    fold p in parts with intermediate acc "":
+        acc.concat(p)
+
+private fn same_style?(a: tui::canvas::Cell, b: tui::canvas::Cell) -> bool:
+    a.fg == b.fg and a.bg == b.bg and a.attrs == b.attrs
+
+# First index >= X whose cell is unchanged or has a different style than
+# START's cell; W if the run reaches the end of the row.
+private fn run_end(cells: List[tui::canvas::Cell], changed: List[bool], base: int, start: tui::canvas::Cell, x: int, w: int) -> int:
+    if x >= w:
+        return w
+    if changed.get(x, false) and start.same_style?(cells.get(base + x, start)):
+        return cells.run_end(changed, base, start, x + 1, w)
+    x
+
+private fn row_output(prev: tui::canvas::Screen, next: tui::canvas::Screen, y: int, all: bool) -> str:
+    w = next.width
+    base = y * w
+    blank = tui::canvas::blank_cell()
+    changed = loop x from 0 to w:
+        before = if all:
+            blank
+        else:
+            prev.cells.get(base + x, blank)
+        next.cells.get(base + x, blank) != before
+    runs = loop x from 0 to w:
+        here = next.cells.get(base + x, blank)
+        if not changed.get(x, false):
+            continue
+        if x > 0 and changed.get(x - 1, false) and here.same_style?(next.cells.get(base + x - 1, blank)):
+            continue
+        e = next.cells.run_end(changed, base, here, x + 1, w)
+        cps = loop k from x to e:
+            next.cells.get(base + k, blank).ch
+        cursor_to(x, y).concat(sgr(cell_style(here))).concat(tui::text::from_codepoints(cps))
+    concat_all(runs)
+
+private fn draw(prev: tui::canvas::Screen, next: tui::canvas::Screen, all: bool) -> str:
+    rows = loop y from 0 to next.height:
+        prev.row_output(next, y, all)
+    body = concat_all(rows)
+    if body.length() == 0:
+        return ""
+    body.concat(reset_style())
+
+# A full redraw: clear the terminal, then draw every cell of SCREEN.
+fn full(screen: tui::canvas::Screen) -> str:
+    reset_style().concat(clear_screen()).concat(screen.draw(screen, true))
+
+# The output that turns a terminal showing PREV into one showing NEXT.
+# Identical screens produce ""; screens of different sizes produce a full
+# redraw (the terminal was resized).
+fn diff(prev: tui::canvas::Screen, next: tui::canvas::Screen) -> str:
+    if prev.width != next.width or prev.height != next.height:
+        return full(next)
+    prev.draw(next, false)
+
+# TEXT with each ESC shown as the two characters "\e" (for assertions and logs).
+fn visible(text: str) -> str:
+    cps = tui::text::raw_codepoints(text)
+    fold cp in cps with intermediate acc "":
+        if cp == 27:
+            acc.concat("\\e")
+        else:
+            acc.append_code(cp)

@@ -1,0 +1,34 @@
+# A menu application written by the consumer project against the installed tui package.
+import std::str
+import tui::app
+import tui::canvas
+import tui::input
+import tui::layout
+import tui::style
+import tui::widgets
+
+struct Menu:
+    list: tui::widgets::ListState
+    chosen: str
+    done: bool
+
+fn initial() -> Menu:
+    Menu {list: tui::widgets::list_state(["New game", "Load game", "Options", "Quit"]), chosen: "", done: false}
+
+fn update(menu: Menu, event: tui::input::Event) -> Menu:
+    if tui::widgets::activated?(event):
+        picked = menu.list.selected_item()
+        return Menu {list: menu.list, chosen: picked, done: picked == "Quit"}
+    Menu {list: menu.list.list_update(event), chosen: menu.chosen, done: menu.done}
+
+fn view(menu: Menu, width: int, height: int) -> tui::canvas::Canvas:
+    plain = tui::style::plain()
+    shown = if menu.chosen == "":
+        "Pick an entry"
+    else:
+        "You chose: ".concat(menu.chosen)
+    ui = tui::layout::vstack([tui::layout::label("Main menu", plain.bold()), menu.list.list_node(4, true, plain, plain.reverse()), tui::layout::spacer(), tui::widgets::status_bar(shown, plain)])
+    tui::canvas::new(width, height).draw(ui)
+
+fn finished?(menu: Menu) -> bool:
+    menu.done

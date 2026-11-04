@@ -1,0 +1,332 @@
+# tui::session -- Layer B: the Linux terminal session adapter.
+#
+# This is the ONLY module of the package that touches the operating system.
+# Everything above it (canvas, ansi, input, layout, widgets) is pure and
+# portable; this module needs a native backend on Linux x86-64 and a real
+# terminal.  The standard library has no terminal API (no termios, no isatty,
+# no window size, no poll, no signals), so the adapter is built on the
+# documented raw-syscall transport std::linux::abi::x86_64::syscall:
+#   ioctl(TCGETS/TCSETS)  terminal modes: raw (no line buffering, no echo)
+#   ioctl(TIOCGWINSZ)     terminal size
+#   poll(2)               wait for input with a timeout, no busy-polling
+#   read(2) / write(2)    bytes in and out
+# Authority is mediated by the Terminal context: every function that makes a
+# syscall requires it, so a program must install it explicitly:
+#     with context tui::session::create()
+# Terminal state is owned by an `opaque resource struct` (Session) whose
+# cleanup restores the terminal when `run` leaves, normally or by an error.
+#
+# Limits, stated honestly:
+#   * Resize is detected by sampling TIOCGWINSZ every resize_poll_ms while the
+#     terminal is idle (std programs run on a worker thread, so a SIGWINCH
+#     signalfd never sees the signal).  Resizes are noticed within that delay.
+#   * A lone Escape is resolved by silence: escape_timeout_ms (see tui::input).
+#   * Nothing can be restored after SIGKILL/SIGTERM or a crashed process.
+#   * Interpreter and `compile` backends refuse the syscalls (NATIVE-ONLY):
+#     use -backend cranelift or build a native executable.
+
+import std::list
+import std::str
+import std::int
+import std::abi
+import std::abi::bytes
+import std::abi::x86_64
+import std::linux::abi::x86_64
+import std::binary
+import std::byte
+import tui::text
+import tui::canvas
+import tui::ansi
+import tui::input
+import tui::app
+
+escape_timeout_ms = 50
+resize_poll_ms = 100
+
+# stream is "input" or "output": the standard stream that is not a terminal.
+error NotATerminal:
+    stream: str
+
+# operation names the step that failed: configure, read, poll or write.
+error IoFailed:
+    operation: str
+
+opaque context struct Terminal:
+    input_fd: std::abi::I32
+    output_fd: std::abi::I32
+
+# The terminal authority.  Install it once, before any session call:
+#     with context tui::session::create()
+fn create() -> Terminal:
+    Terminal {input_fd: std::abi::i32(0), output_fd: std::abi::i32(1)}
+
+layout Termios:
+    size 36
+    align 4
+    field iflag: std::binary::U32 at 0
+    field oflag: std::binary::U32 at 4
+    field cflag: std::binary::U32 at 8
+    field lflag: std::binary::U32 at 12
+    field line: std::binary::U8 at 16
+    field cc: array 19 of std::binary::U8 at 17
+
+layout WinSize:
+    size 8
+    align 2
+    field rows: std::binary::U16 at 0
+    field cols: std::binary::U16 at 2
+    field xpixel: std::binary::U16 at 4
+    field ypixel: std::binary::U16 at 6
+
+layout PollFd:
+    size 8
+    align 4
+    field fd: std::binary::I32 at 0
+    field events: std::binary::I16 at 4
+    field revents: std::binary::I16 at 6
+
+layout InBuf:
+    size 64
+    align 1
+    field bytes: array 64 of std::binary::U8 at 0
+
+private struct Sys:
+    rc: int
+    data: std::abi::bytes::MutableBytes
+
+struct Size:
+    width: int
+    height: int
+
+opaque resource struct Session:
+    saved: std::abi::bytes::Bytes
+
+private fn word(n: int) -> std::abi::x86_64::Register64:
+    std::abi::x86_64::register64(n):
+        on std::abi::x86_64::Register64BelowRange:
+            std::abi::x86_64::register64(0)
+        on std::abi::x86_64::Register64AboveRange:
+            std::abi::x86_64::register64(0)
+
+private fn buffer(n: int) -> std::abi::bytes::MutableBytes:
+    length = std::abi::usize(n):
+        on std::abi::AbiIntegerBelowRange:
+            std::abi::usize(0)
+        on std::abi::AbiIntegerAboveRange:
+            std::abi::usize(0)
+    std::abi::bytes::zeroed(length)
+
+# ioctl(FD, REQUEST, BUF): BUF is the argument memory.
+private fn ioctl(fd: std::abi::I32, request: int, buf: std::abi::bytes::MutableBytes, context term: Terminal) -> Sys:
+    d = std::abi::bytes::detach(buf)
+    rc = std::linux::abi::x86_64::syscall({rax: word(16), rdi: word(fd.value), rsi: word(request), rdx: std::abi::x86_64::from_mutable_bytes(d)})
+    Sys {rc: std::abi::x86_64::to_int(rc), data: d}
+
+# poll(2) of one descriptor for input, TIMEOUT milliseconds; the raw result.
+private fn poll_input(fd: std::abi::I32, timeout: int, context term: Terminal) -> int:
+    request = std::binary::emit(LayoutStruct[PollFd] {fd: fd.value, events: 1, revents: 0}):
+        on LayoutExtentMismatch:
+            return -22
+    d = std::abi::bytes::from_bytes(request)
+    rc = std::linux::abi::x86_64::syscall({rax: word(7), rdi: std::abi::x86_64::from_mutable_bytes(d), rsi: word(1), rdx: word(timeout)})
+    std::abi::x86_64::to_int(rc)
+
+# read(2) of up to the buffer's length from FD.
+private fn read_into(fd: std::abi::I32, buf: std::abi::bytes::MutableBytes, context term: Terminal) -> Sys:
+    d = std::abi::bytes::detach(buf)
+    rc = std::linux::abi::x86_64::syscall({rax: word(0), rdi: word(fd.value), rsi: std::abi::x86_64::from_mutable_bytes(d), rdx: word(std::abi::bytes::mutable_length(d).value)})
+    Sys {rc: std::abi::x86_64::to_int(rc), data: d}
+
+# One write(2) of DATA to FD; the raw result.
+private fn write_once(fd: std::abi::I32, data: std::abi::bytes::Bytes, context term: Terminal) -> int:
+    rc = std::linux::abi::x86_64::syscall({rax: word(1), rdi: word(fd.value), rsi: std::abi::x86_64::from_bytes(data), rdx: word(std::abi::bytes::length(data).value)})
+    std::abi::x86_64::to_int(rc)
+
+# Write all of DATA, completing short writes and retrying EINTR.
+private fn write_all(fd: std::abi::I32, data: std::abi::bytes::Bytes, context term: Terminal) -> unit errors IoFailed:
+    total = std::abi::bytes::length(data).value
+    if total == 0:
+        return unit
+    n = fd.write_once(data)
+    if n == -4:
+        return fd.write_all(data)
+    if n <= 0:
+        fail IoFailed {operation: "write"}
+    if n >= total:
+        return unit
+    rest = data.slice(n, total):
+        on LowerUnderrun:
+            fail IoFailed {operation: "write offset"}
+        on UpperOverrun:
+            fail IoFailed {operation: "write length"}
+    fd.write_all(rest)
+
+private fn text_bytes(text: str) -> std::abi::bytes::Bytes:
+    std::abi::bytes::from_list(text.encode_utf8())
+
+# Send TEXT (trusted terminal output, typically from tui::ansi) to the terminal.
+fn write_text(text: str, context term: Terminal) -> unit errors IoFailed:
+    term.output_fd.write_all(text_bytes(text))
+
+# The terminal's current termios as raw bytes (kept to restore it later).
+private fn query_termios(context term: Terminal) -> std::abi::bytes::MutableBytes errors NotATerminal:
+    r = term.input_fd.ioctl(21505, buffer(36))
+    if r.rc < 0:
+        fail NotATerminal {stream: "input"}
+    r.data
+
+private fn query_size(context term: Terminal) -> Size errors NotATerminal:
+    r = term.output_fd.ioctl(21523, buffer(8))
+    if r.rc < 0:
+        fail NotATerminal {stream: "output"}
+    w = std::binary::parse(WinSize, std::abi::bytes::freeze(r.data)):
+        on LayoutLengthMismatch:
+            fail NotATerminal {stream: "size"}
+    if w.cols == 0 or w.rows == 0:
+        return Size {width: 80, height: 24}
+    Size {width: w.cols, height: w.rows}
+
+# True when both standard input and standard output are terminals.
+fn tty?(context term: Terminal) -> bool:
+    r = term.input_fd.ioctl(21505, buffer(36))
+    s = term.output_fd.ioctl(21523, buffer(8))
+    r.rc >= 0 and s.rc >= 0
+
+# The terminal's current size in cells.
+fn size(context term: Terminal) -> Size errors NotATerminal:
+    query_size()
+
+private fn word32(n: int) -> std::binary::U32:
+    if n < 0 or n > 4294967295:
+        return 0
+    n
+
+private fn clear_bits(flags: int, bits: int) -> std::binary::U32:
+    word32(bit_and(flags, bit_xor(4294967295, bits)))
+
+# The termios of raw mode, derived from ORIG by writing individual fields: no
+# line buffering, no echo, no signals from the keyboard (Ctrl+C, Ctrl+Z arrive
+# as events), no CR/NL translation on input, 8-bit characters; VMIN = 1,
+# VTIME = 0 (a read returns after one byte).  Every other byte is kept.
+# If ORIG is malformed it is returned unchanged.
+private fn raw_fields(orig: std::abi::bytes::MutableBytes) -> std::abi::bytes::MutableBytes errors LayoutLengthMismatch:
+    t = std::binary::parse(Termios, std::abi::bytes::freeze(orig))
+    a = std::binary::write(orig, Termios.iflag, t.iflag.clear_bits(1522))
+    b = std::binary::write(a, Termios.cflag, word32(bit_or(t.cflag.clear_bits(304), 48)))
+    c = std::binary::write(b, Termios.lflag, t.lflag.clear_bits(32843))
+    d = std::binary::write(c, Termios.cc[5], 0)
+    std::binary::write(d, Termios.cc[6], 1)
+
+private fn raw_termios(orig: std::abi::bytes::MutableBytes) -> std::abi::bytes::MutableBytes:
+    raw_fields(orig):
+        on LayoutLengthMismatch:
+            orig
+
+private fn apply_termios(data: std::abi::bytes::MutableBytes, context term: Terminal) -> int:
+    term.input_fd.ioctl(21506, data).rc
+
+private fn prelude() -> str:
+    tui::ansi::enter_alternate_screen().concat(tui::ansi::disable_wrap()).concat(tui::ansi::hide_cursor()).concat(tui::ansi::clear_screen())
+
+private fn postlude() -> str:
+    tui::ansi::reset_style().concat(tui::ansi::enable_wrap()).concat(tui::ansi::show_cursor()).concat(tui::ansi::leave_alternate_screen())
+
+# Restores the terminal: screen state first, then the saved termios.  Runs
+# automatically where the Session's owner ends, including after an error.
+cleanup fn restore(session: Session, context term: Terminal):
+    {saved} = session
+    write_text(postlude()):
+        on IoFailed:
+            unit
+    apply_termios(std::abi::bytes::from_bytes(saved))
+    unit
+
+# Put the terminal in raw mode on the alternate screen.  The returned Session
+# is the obligation to restore it (a resource: it is released at the end of
+# the scope that owns it).
+fn open(context term: Terminal) -> Session errors NotATerminal, IoFailed:
+    saved = query_termios()
+    size = query_size()
+    if apply_termios(raw_termios(saved)) < 0:
+        fail IoFailed {operation: "configure"}
+    session = Session {saved: std::abi::bytes::freeze(saved)}
+    write_text(prelude())
+    session
+
+private struct Chunk:
+    count: int
+    bytes: List[int]
+
+private fn read_chunk(context term: Terminal) -> Chunk:
+    r = term.input_fd.read_into(buffer(64))
+    parsed = std::binary::parse(InBuf, std::abi::bytes::freeze(r.data)):
+        on LayoutLengthMismatch:
+            return Chunk {count: -22, bytes: []}
+    n = if r.rc > 64:
+        64
+    else:
+        r.rc
+    bytes = loop i from 0 to n:
+        tui::text::widen(parsed.bytes.get(i, 0))
+    Chunk {count: r.rc, bytes: bytes}
+
+# What one wait for input produced.
+private struct Woke:
+    decoder: tui::input::Decoder
+    events: List[tui::input::Event]
+    size: Size
+    closed: bool
+
+private fn resized(old: Size, now: Size) -> List[tui::input::Event]:
+    if old.width != now.width or old.height != now.height:
+        return [tui::input::resize(now.width, now.height)]
+    []
+
+# Wait up to the idle timeout for input (bytes are decoded, a lone Escape is
+# resolved by the escape timeout) and report the size at wake-up.
+private fn wait(decoder: tui::input::Decoder, current: Size, context term: Terminal) -> Woke errors NotATerminal, IoFailed:
+    timeout = if tui::input::pending?(decoder):
+        50
+    else:
+        100
+    rc = term.input_fd.poll_input(timeout)
+    now = query_size()
+    if rc == 0 or rc == -4:
+        flushed = tui::input::flush(decoder)
+        return Woke {decoder: flushed.decoder, events: [flushed.events, current.resized(now)].flat(), size: now, closed: false}
+    if rc < 0:
+        fail IoFailed {operation: "poll"}
+    chunk = read_chunk()
+    if chunk.count == 0:
+        flushed = tui::input::flush(decoder)
+        return Woke {decoder: flushed.decoder, events: flushed.events, size: now, closed: true}
+    if chunk.count == -4 or chunk.count == -11:
+        return Woke {decoder: decoder, events: current.resized(now), size: now, closed: false}
+    if chunk.count < 0:
+        fail IoFailed {operation: "read"}
+    fed = decoder.feed(chunk.bytes)
+    Woke {decoder: fed.decoder, events: [fed.events, current.resized(now)].flat(), size: now, closed: false}
+
+private nomethod fn drive(app: tui::app::Application, decoder: tui::input::Decoder, shown: tui::canvas::Screen, size: Size, dirty: bool, context term: Terminal) -> unit errors NotATerminal, IoFailed, tui::app::Abort:
+    if app.finished?():
+        return unit
+    now_shown = if dirty:
+        next = app.view(size.width, size.height).rasterize()
+        write_text(shown.diff(next))
+        next
+    else:
+        shown
+    woke = decoder.wait(size)
+    next_app = tui::app::apply_events(app, woke.events, 0)
+    if woke.closed:
+        return unit
+    drive(next_app, woke.decoder, now_shown, woke.size, woke.events.length() > 0)
+
+# Run APP in the terminal until finished?(app) is true or the input ends.  The
+# terminal is restored before run returns or fails.  Fails with NotATerminal
+# when stdin/stdout are not terminals, IoFailed when the terminal cannot be
+# configured, read or written, and tui::app::Abort when the application's update fails.
+fn run(app: tui::app::Application, context term: Terminal) -> unit errors NotATerminal, IoFailed, tui::app::Abort:
+    session = open()
+    start = query_size()
+    drive(app, tui::input::new_decoder(), tui::canvas::blank(0, 0), start, true)

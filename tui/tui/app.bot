@@ -1,0 +1,41 @@
+# tui::app -- the application pattern: state + event -> next state,
+# state + dimensions -> canvas.  Portable: nothing here touches a terminal.
+#
+# An application is any value whose own module declares the three functions of
+# the Application interface for its own type (structural: no registration):
+#
+#     update(app, event) -> app           handle one tui::input::Event
+#     view(app, width, height) -> Canvas  draw the state
+#     finished?(app) -> bool              should the session end?
+#
+# `update` may declare `errors tui::app::Abort` (or declare nothing) and may
+# `fail Abort {reason: ...}` to leave a running session with an error.
+# tui::session::run drives an Application in a real terminal; tests drive the
+# same functions directly, or through frame and apply_events below.
+
+import std::list
+import tui::input
+import tui::canvas
+
+# An application's own failure, raised from its update function.
+error Abort:
+    reason: str
+
+trait Application:
+    fn update(app: Application, event: tui::input::Event) -> Application errors Abort
+    fn view(app: Application, width: int, height: int) -> tui::canvas::Canvas
+    fn finished?(app: Application) -> bool
+
+# Apply events I, I+1, ... in order, stopping early once the application is
+# finished.  (An Application value cannot be inspected through the interface:
+# keep calling the application's own functions in tests, and use this inside
+# runners.)
+nomethod fn apply_events(app: Application, events: List[tui::input::Event], i: int) -> Application errors Abort:
+    if i >= events.length() or app.finished?():
+        return app
+    next = app.update(events.get(i, tui::input::key(tui::input::Kind::Unknown)))
+    apply_events(next, events, i + 1)
+
+# The screen the application shows at WIDTH x HEIGHT.
+fn frame(app: Application, width: int, height: int) -> tui::canvas::Screen:
+    app.view(width, height).rasterize()

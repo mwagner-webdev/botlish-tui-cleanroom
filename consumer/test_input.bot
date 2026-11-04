@@ -1,0 +1,227 @@
+# Pure tests: the incremental input decoder.  No terminal.
+import std::list
+import std::str
+import std::test
+import tui::text
+import tui::input
+
+fn esc() -> str:
+    tui::text::char_string(27)
+
+# ESC [ BODY
+fn csi(body: str) -> str:
+    esc().append_char('[').concat(body)
+
+fn ch(cp: int) -> tui::input::Event:
+    tui::input::char_event(cp)
+
+fn k(kind: tui::input::Kind) -> tui::input::Event:
+    tui::input::key(kind)
+
+fn s(c: UnicodeChar) -> str:
+    "".append_char(c)
+
+fn text_bytes(s: str) -> List[int]:
+    bs = s.encode_utf8()
+    loop i from 0 to bs.length():
+        tui::text::widen(bs.at(i))
+
+fn take(xs: List[int], n: int) -> List[int]:
+    loop i from 0 to n:
+        xs.get(i, 0)
+
+fn drop(xs: List[int], n: int) -> List[int]:
+    loop i from n to xs.length():
+        xs.get(i, 0)
+
+# Feed BYTES in chunks of the given sizes (the last chunk takes the rest), then flush.
+fn chunked(bytes: List[int], first: int, second: int) -> List[tui::input::Event]:
+    a = tui::input::new_decoder().feed(bytes.take(first))
+    b = a.decoder.feed(bytes.drop(first).take(second))
+    c = b.decoder.feed(bytes.drop(first + second))
+    d = tui::input::flush(c.decoder)
+    [a.events, b.events, c.events, d.events].flat()
+
+fn same_at_every_split(s: str) -> bool:
+    bytes = text_bytes(s)
+    whole = tui::input::decode_all(bytes)
+    fold i from 0 to bytes.length() + 1 with intermediate ok true:
+        inner = fold j from 0 to bytes.length() + 1 - i with intermediate ok2 true:
+            ok2 and bytes.chunked(i, j) == whole
+        ok and inner
+
+fn bytewise(bytes: List[int]) -> List[tui::input::Event]:
+    r = fold b in bytes with intermediate acc {decoder: tui::input::new_decoder(), events: []}:
+        step = acc.decoder.feed([b])
+        {decoder: step.decoder, events: [acc.events, step.events].flat()}
+    [r.events, tui::input::flush(r.decoder).events].flat()
+
+fn reg_keys():
+    fn printable():
+        tui::input::decode_text("aZ ~")
+    std::test::value("keys: printable ASCII", [ch(97), ch(90), ch(32), ch(126)], printable)
+
+    fn named():
+        tui::input::decode_all([13, 9, 127, 8])
+    std::test::value("keys: Enter, Tab, Backspace (DEL and ^H)", [k(tui::input::Kind::Enter), k(tui::input::Kind::Tab), k(tui::input::Kind::Backspace), k(tui::input::Kind::Backspace)], named)
+
+    fn controls():
+        tui::input::decode_all([1, 3, 26, 0, 28])
+    std::test::value("keys: Ctrl+letter combinations", [tui::input::ctrl_char(97), tui::input::ctrl_char(99), tui::input::ctrl_char(122), tui::input::ctrl_char(32), tui::input::ctrl_char(92)], controls)
+
+    fn arrows():
+        tui::input::decode_text(csi(s('A')).concat(csi(s('B'))).concat(csi(s('C'))).concat(csi(s('D'))))
+    std::test::value("keys: arrow keys", [k(tui::input::Kind::Up), k(tui::input::Kind::Down), k(tui::input::Kind::Right), k(tui::input::Kind::Left)], arrows)
+
+    fn editing_keys():
+        tui::input::decode_text(csi(s('H')).concat(csi(s('F'))).concat(csi("1~")).concat(csi("4~")).concat(csi("2~")).concat(csi("3~")).concat(csi("5~")).concat(csi("6~")))
+    std::test::value("keys: Home, End, Insert, Delete, PageUp, PageDown", [k(tui::input::Kind::Home), k(tui::input::Kind::End), k(tui::input::Kind::Home), k(tui::input::Kind::End), k(tui::input::Kind::Insert), k(tui::input::Kind::Delete), k(tui::input::Kind::PageUp), k(tui::input::Kind::PageDown)], editing_keys)
+
+    fn function_keys():
+        tui::input::decode_text(esc().concat("OP").concat(esc()).concat("OS").concat(csi("15~")).concat(csi("24~")))
+    std::test::value("keys: function keys (SS3 and CSI forms)", [tui::input::function_key(1), tui::input::function_key(4), tui::input::function_key(5), tui::input::function_key(12)], function_keys)
+
+    fn application_cursor():
+        tui::input::decode_text(esc().concat("OA").concat(esc()).concat("OH"))
+    std::test::value("keys: application-mode cursor keys (ESC O A)", [k(tui::input::Kind::Up), k(tui::input::Kind::Home)], application_cursor)
+
+    fn back_tab():
+        tui::input::decode_text(csi(s('Z')))
+    std::test::value("keys: Shift+Tab", [k(tui::input::Kind::BackTab)], back_tab)
+
+    fn modified():
+        tui::input::decode_text(csi("1;5A").concat(csi("1;2C")).concat(csi("1;3D")).concat(csi("3;6~")))
+    std::test::value("keys: xterm modifiers (Ctrl+Up, Shift+Right, Alt+Left, Ctrl+Shift+Delete)", [k(tui::input::Kind::Up).with_ctrl(), k(tui::input::Kind::Right).with_shift(), k(tui::input::Kind::Left).with_alt(), k(tui::input::Kind::Delete).with_ctrl().with_shift()], modified)
+
+    fn alt_keys():
+        tui::input::decode_text(esc().concat(s('x')).concat(esc()).concat(s('Z')))
+    std::test::value("keys: Alt+key is ESC followed by the key", [ch(120).with_alt(), ch(90).with_alt()], alt_keys)
+
+    fn utf8():
+        tui::input::decode_text("é世😀")
+    std::test::value("keys: UTF-8 characters of 2, 3 and 4 bytes", [ch(233), ch(19990), ch(128512)], utf8)
+
+    fn predicates():
+        e = ch(113)
+        c = tui::input::ctrl_char(113)
+        {plain: e.is_char?(113), ctrl_is_not_plain: c.is_char?(113), ctrl: c.is_ctrl?(113), key: k(tui::input::Kind::Enter).is_key?(tui::input::Kind::Enter)}
+    std::test::value("keys: predicates", {plain: true, ctrl_is_not_plain: false, ctrl: true, key: true}, predicates)
+
+fn reg_chunks():
+    fn several_in_one_chunk():
+        tui::input::decode_text("ab".concat(csi(s('A'))).concat(s('c')).concat(csi("1;5C")))
+    std::test::value("chunks: several events in one read", [ch(97), ch(98), k(tui::input::Kind::Up), ch(99), k(tui::input::Kind::Right).with_ctrl()], several_in_one_chunk)
+
+    fn split_arrow_everywhere():
+        same_at_every_split(csi(s('A')))
+    std::test::value("chunks: ESC [ A split at every byte boundary", true, split_arrow_everywhere)
+
+    fn split_mixed_everywhere():
+        same_at_every_split(s('x').concat(csi("1;5A")).concat(s('é')).concat(esc()).concat("OP").concat(s('q')).concat(csi("15~")).concat(esc()).concat(s('z')))
+    std::test::value("chunks: a mixed stream split at every pair of boundaries", true, split_mixed_everywhere)
+
+    fn bytewise_equals_whole():
+        s = "ab".concat(csi(s('B'))).concat(s('世')).concat(csi("3~")).concat(esc()).concat(s('x'))
+        bytewise(text_bytes(s)) == tui::input::decode_text(s)
+    std::test::value("chunks: one byte per read gives the same events", true, bytewise_equals_whole)
+
+    fn pending_state():
+        a = tui::input::new_decoder().feed([27, 91])
+        b = a.decoder.feed([49, 59])
+        c = b.decoder.feed([53, 67])
+        {a: {events: a.events.length(), pending: a.decoder.pending?()}, b: {events: b.events.length(), pending: b.decoder.pending?()}, c: {events: c.events, pending: c.decoder.pending?()}}
+    std::test::value("chunks: the decoder keeps a partial sequence until it completes", {a: {events: 0, pending: true}, b: {events: 0, pending: true}, c: {events: [k(tui::input::Kind::Right).with_ctrl()], pending: false}}, pending_state)
+
+fn reg_escape():
+    fn lone_escape_is_held():
+        a = tui::input::new_decoder().feed([27])
+        {events: a.events.length(), pending: a.decoder.pending?()}
+    std::test::value("escape: a lone ESC byte emits nothing yet", {events: 0, pending: true}, lone_escape_is_held)
+
+    fn flush_resolves_escape():
+        a = tui::input::new_decoder().feed([27])
+        f = tui::input::flush(a.decoder)
+        {events: f.events, pending: f.decoder.pending?()}
+    std::test::value("escape: flush (the timeout) resolves it as the Escape key", {events: [k(tui::input::Kind::Escape)], pending: false}, flush_resolves_escape)
+
+    fn escape_then_key():
+        tui::input::decode_all([27, 120])
+    std::test::value("escape: ESC then a key within the timeout is Alt+key", [ch(120).with_alt()], escape_then_key)
+
+    fn double_escape():
+        tui::input::decode_all([27, 27])
+    std::test::value("escape: ESC ESC is Escape, Escape", [k(tui::input::Kind::Escape), k(tui::input::Kind::Escape)], double_escape)
+
+    fn escape_then_control():
+        tui::input::decode_all([27, 1])
+    std::test::value("escape: ESC followed by a control byte is Escape then the control key", [k(tui::input::Kind::Escape), tui::input::ctrl_char(97)], escape_then_control)
+
+    fn alt_bracket():
+        tui::input::decode_all([27, 91])
+    std::test::value("escape: ESC [ at the timeout is Alt+[", [ch(91).with_alt()], alt_bracket)
+
+    fn escape_at_end_of_input():
+        tui::input::decode_text(s('a').concat(esc()))
+    std::test::value("escape: end of input flushes a pending ESC", [ch(97), k(tui::input::Kind::Escape)], escape_at_end_of_input)
+
+fn reg_malformed():
+    fn unknown_sequences():
+        tui::input::decode_text(csi("99z").concat(csi("?25h")).concat(csi("<0;5;6M")))
+    std::test::value("malformed: unknown or private sequences are Unknown events", [k(tui::input::Kind::Unknown), k(tui::input::Kind::Unknown), k(tui::input::Kind::Unknown)], unknown_sequences)
+
+    fn interrupted_sequence():
+        tui::input::decode_text(csi("").concat(csi(s('A'))))
+    std::test::value("malformed: an ESC inside a sequence aborts it and starts a new one", [k(tui::input::Kind::Unknown), k(tui::input::Kind::Up)], interrupted_sequence)
+
+    fn control_inside_sequence():
+        tui::input::decode_all([27, 91, 49, 10, 120])
+    std::test::value("malformed: a control byte inside a sequence aborts it and is processed normally", [k(tui::input::Kind::Unknown), tui::input::ctrl_char(106), ch(120)], control_inside_sequence)
+
+    fn stray_continuation():
+        tui::input::decode_all([128, 97])
+    std::test::value("malformed: a stray UTF-8 continuation byte is U+FFFD", [ch(65533), ch(97)], stray_continuation)
+
+    fn bad_utf8():
+        tui::input::decode_all([195, 40, 224, 128, 175, 237, 160, 128, 192, 175, 255])
+    std::test::value("malformed: broken, overlong, surrogate and invalid lead bytes are U+FFFD", [ch(65533), ch(40), ch(65533), ch(65533), ch(65533), ch(65533), ch(65533)], bad_utf8)
+
+    fn truncated_utf8():
+        tui::input::decode_all([97, 226, 130])
+    std::test::value("malformed: truncated UTF-8 at end of input is U+FFFD", [ch(97), ch(65533)], truncated_utf8)
+
+    fn incomplete_csi_at_end():
+        tui::input::decode_all([27, 91, 49, 59])
+    std::test::value("malformed: an incomplete CSI at end of input is one Unknown event", [k(tui::input::Kind::Unknown)], incomplete_csi_at_end)
+
+fn long_garbage(n: int) -> List[int]:
+    loop i from 0 to n:
+        57
+
+fn pending_size_after(n: int) -> int:
+    r = tui::input::new_decoder().feed([[27, 91], long_garbage(n)].flat())
+    r.decoder.pending.length()
+
+fn reg_limits():
+    fn pending_is_bounded():
+        {after_10: pending_size_after(10), after_29: pending_size_after(29), after_30: pending_size_after(30), after_100000: pending_size_after(100000)}
+    std::test::value("limits: the pending sequence stays below max_sequence (32) bytes", {after_10: 12, after_29: 31, after_30: 0, after_100000: 0}, pending_is_bounded)
+
+    fn overlong_sequence_is_one_unknown():
+        tui::input::decode_all([[27, 91], long_garbage(100), [65], [120]].flat())
+    std::test::value("limits: an over-long sequence is one Unknown, its tail is discarded, decoding resumes", [k(tui::input::Kind::Unknown), ch(120)], overlong_sequence_is_one_unknown)
+
+    fn many_events():
+        events = tui::input::decode_all(long_garbage(5000))
+        events.length()
+    std::test::value("limits: 5000 key events in a single chunk", 5000, many_events)
+
+fn register_all():
+    reg_keys()
+    reg_chunks()
+    reg_escape()
+    reg_malformed()
+    reg_limits()
+
+with context std::test::suite()
+register_all()
+std::test::report()

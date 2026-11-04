@@ -1,0 +1,220 @@
+# Pure tests: widget state transitions and rendering.  No terminal.
+import std::list
+import std::str
+import std::test
+import tui::style
+import tui::text
+import tui::input
+import tui::canvas
+import tui::layout
+import tui::widgets
+
+fn s(c: UnicodeChar) -> str:
+    "".append_char(c)
+
+fn plain() -> tui::style::Style:
+    tui::style::plain()
+
+fn picture(width: int, height: int, node: tui::layout::Node) -> List[str]:
+    tui::canvas::new(width, height).draw(node).rasterize().lines()
+
+fn key(kind: tui::input::Kind) -> tui::input::Event:
+    tui::input::key(kind)
+
+fn typed(text: str) -> List[tui::input::Event]:
+    tui::input::decode_text(text)
+
+fn edit(t: tui::widgets::TextInput, events: List[tui::input::Event]) -> tui::widgets::TextInput:
+    fold e in events with intermediate acc t:
+        acc.input_update(e)
+
+fn navigate(l: tui::widgets::ListState, events: List[tui::input::Event]) -> tui::widgets::ListState:
+    fold e in events with intermediate acc l:
+        acc.list_update(e)
+
+fn repeat(e: tui::input::Event, n: int) -> List[tui::input::Event]:
+    loop i from 0 to n:
+        e
+
+fn attrs_at(screen: tui::canvas::Screen, x: int, y: int) -> int:
+    c = screen.cell_at(x, y):
+        on tui::canvas::OutOfBounds:
+            return -1
+    c.attrs
+
+fn reg_focus():
+    fn cycling():
+        f = tui::widgets::focus(3)
+        a = f.focus_next().focus_next()
+        {start: f.index, two: a.index, wrapped: a.focus_next().index, back: f.focus_prev().index}
+    std::test::value("focus: next/prev wrap around", {start: 0, two: 2, wrapped: 0, back: 2}, cycling)
+
+    fn tab_events():
+        f = tui::widgets::focus(3)
+        {tab: f.focus_update(key(tui::input::Kind::Tab)).index, shift_tab: f.focus_update(key(tui::input::Kind::BackTab)).index, other: f.focus_update(tui::input::char_event(97)).index}
+    std::test::value("focus: Tab and Shift+Tab move it, other events do not", {tab: 1, shift_tab: 2, other: 0}, tab_events)
+
+    fn degenerate():
+        {zero: tui::widgets::focus(0).focus_next().index, set_low: tui::widgets::focus(3).focus_set(-4).index, set_high: tui::widgets::focus(3).focus_set(9).index, focused: tui::widgets::focus(2).focused?(0)}
+    std::test::value("focus: degenerate counts and indexes are clamped", {zero: 0, set_low: 0, set_high: 2, focused: true}, degenerate)
+
+fn reg_button():
+    fn activation():
+        {enter: tui::widgets::activated?(key(tui::input::Kind::Enter)), space: tui::widgets::activated?(tui::input::char_event(32)), letter: tui::widgets::activated?(tui::input::char_event(97)), ctrl_enter: tui::widgets::activated?(key(tui::input::Kind::Enter).with_ctrl())}
+    std::test::value("button: Enter and Space activate; other keys do not", {enter: true, space: true, letter: false, ctrl_enter: false}, activation)
+
+    fn look():
+        a = picture(10, 1, tui::widgets::button("OK", false, plain()))
+        b = tui::canvas::new(10, 1).draw(tui::widgets::button("OK", true, plain())).rasterize()
+        {text: a, plain_attrs: 0, focused_attrs: b.attrs_at(0, 0)}
+    std::test::value("button: drawn as [ label ], reverse video when focused", {text: ["[ OK ]    "], plain_attrs: 0, focused_attrs: 16}, look)
+
+    fn bar():
+        shown = tui::canvas::new(8, 2).draw(tui::layout::vstack([tui::widgets::status_bar("ready", plain()), tui::layout::spacer()])).rasterize()
+        {text: shown.row_text(0), tail: shown.attrs_at(7, 0), below: shown.attrs_at(0, 1)}
+    std::test::value("status bar: full width, reverse video", {text: "ready   ", tail: 16, below: 0}, bar)
+
+fn reg_text_input():
+    fn typing():
+        t = tui::widgets::text_input("").edit(typed("héllo"))
+        {text: t.input_text(), cursor: t.cursor}
+    std::test::value("text input: typing inserts at the cursor", {text: "héllo", cursor: 5}, typing)
+
+    fn insert_in_middle():
+        t = tui::widgets::text_input("abcd").edit([key(tui::input::Kind::Left), key(tui::input::Kind::Left), tui::input::char_event(88)])
+        {text: t.input_text(), cursor: t.cursor}
+    std::test::value("text input: inserting in the middle", {text: "abXcd", cursor: 3}, insert_in_middle)
+
+    fn backspace_and_delete():
+        t = tui::widgets::text_input("abcd").edit([key(tui::input::Kind::Backspace), key(tui::input::Kind::Left), key(tui::input::Kind::Left), key(tui::input::Kind::Delete)])
+        {text: t.input_text(), cursor: t.cursor}
+    std::test::value("text input: Backspace and Delete", {text: "ac", cursor: 1}, backspace_and_delete)
+
+    fn edges():
+        t = tui::widgets::text_input("ab").edit([key(tui::input::Kind::Home), key(tui::input::Kind::Backspace), key(tui::input::Kind::Left), key(tui::input::Kind::End), key(tui::input::Kind::Delete), key(tui::input::Kind::Right)])
+        {text: t.input_text(), cursor: t.cursor}
+    std::test::value("text input: nothing happens past either end", {text: "ab", cursor: 2}, edges)
+
+    fn control_keys():
+        base = tui::widgets::text_input("hello world")
+        a = base.edit([key(tui::input::Kind::Left), key(tui::input::Kind::Left), tui::input::ctrl_char(97)])
+        b = a.edit([tui::input::ctrl_char(101)])
+        c = base.edit([key(tui::input::Kind::Left), key(tui::input::Kind::Left), key(tui::input::Kind::Left), key(tui::input::Kind::Left), key(tui::input::Kind::Left), key(tui::input::Kind::Left), tui::input::ctrl_char(107)])
+        d = base.edit([key(tui::input::Kind::Left), key(tui::input::Kind::Left), key(tui::input::Kind::Left), key(tui::input::Kind::Left), key(tui::input::Kind::Left), key(tui::input::Kind::Left), tui::input::ctrl_char(117)])
+        {home: a.cursor, end: b.cursor, kill_to_end: c.input_text(), kill_to_start: d.input_text()}
+    std::test::value("text input: Ctrl+A, Ctrl+E, Ctrl+K, Ctrl+U", {home: 0, end: 11, kill_to_end: "hello", kill_to_start: " world"}, control_keys)
+
+    fn ignores_unrelated():
+        t = tui::widgets::text_input("ab").edit([key(tui::input::Kind::Tab), key(tui::input::Kind::Enter), key(tui::input::Kind::Escape), key(tui::input::Kind::Up), tui::input::char_event(120).with_alt(), tui::input::ctrl_char(120)])
+        {text: t.input_text(), cursor: t.cursor}
+    std::test::value("text input: Tab, Enter, Escape, Alt+key and unknown Ctrl keys are ignored", {text: "ab", cursor: 2}, ignores_unrelated)
+
+    fn max_length():
+        t = tui::widgets::text_input("").with_max_length(3).edit(typed("abcdef"))
+        t.input_text()
+    std::test::value("text input: max_length limits the text", "abc", max_length)
+
+    fn hostile_text():
+        t = tui::widgets::text_input("").edit([tui::input::char_event(27), tui::input::char_event(10), tui::input::char_event(19990)])
+        t.input_text()
+    std::test::value("text input: control and wide characters are stored as U+FFFD", "���", hostile_text)
+
+    fn render_plain():
+        picture(10, 1, tui::widgets::text_input("abc").input_node(8, false, plain()))
+    std::test::value("text input: unfocused rendering", ["abc       "], render_plain)
+
+    fn render_caret():
+        t = tui::widgets::text_input("abc").edit([key(tui::input::Kind::Left)])
+        shown = tui::canvas::new(8, 1).draw(t.input_node(8, true, plain())).rasterize()
+        {text: shown.row_text(0), before: shown.attrs_at(1, 0), caret: shown.attrs_at(2, 0), after: shown.attrs_at(3, 0)}
+    std::test::value("text input: the caret is a reverse-video cell", {text: "abc     ", before: 0, caret: 16, after: 0}, render_caret)
+
+    fn render_caret_at_end():
+        shown = tui::canvas::new(6, 1).draw(tui::widgets::text_input("ab").input_node(6, true, plain())).rasterize()
+        {text: shown.row_text(0), caret: shown.attrs_at(2, 0), beyond: shown.attrs_at(3, 0)}
+    std::test::value("text input: the caret after the last character", {text: "ab    ", caret: 16, beyond: 0}, render_caret_at_end)
+
+    fn scrolls():
+        t = tui::widgets::text_input("abcdefghij")
+        {end: picture(5, 1, t.input_node(5, true, plain())), home: picture(5, 1, t.edit([key(tui::input::Kind::Home)]).input_node(5, true, plain()))}
+    std::test::value("text input: the visible window follows the caret", {end: ["ghij "], home: ["abcde"]}, scrolls)
+
+fn names() -> List[str]:
+    ["one", "two", "three", "four", "five"]
+
+fn reg_list():
+    fn moving():
+        l = tui::widgets::list_state(names())
+        a = l.navigate(key(tui::input::Kind::Down).repeat(2))
+        b = a.navigate(key(tui::input::Kind::Up).repeat(5))
+        {down: a.selected, up_clamped: b.selected, item: a.selected_item()}
+    std::test::value("list: Up and Down move and clamp at the ends", {down: 2, up_clamped: 0, item: "three"}, moving)
+
+    fn home_end():
+        l = tui::widgets::list_state(names())
+        {end: l.navigate([key(tui::input::Kind::End)]).selected, home: l.navigate([key(tui::input::Kind::End), key(tui::input::Kind::Home)]).selected}
+    std::test::value("list: Home and End", {end: 4, home: 0}, home_end)
+
+    fn paging():
+        l = tui::widgets::list_state(names()).with_page(2)
+        a = l.navigate([key(tui::input::Kind::PageDown), key(tui::input::Kind::PageDown), key(tui::input::Kind::PageDown), key(tui::input::Kind::PageDown)])
+        b = a.navigate([key(tui::input::Kind::PageUp)])
+        {down: a.selected, up: b.selected}
+    std::test::value("list: PageDown and PageUp move by the page size", {down: 4, up: 2}, paging)
+
+    fn scrolling_offset():
+        l = tui::widgets::list_state(names()).with_page(2)
+        a = l.navigate(key(tui::input::Kind::Down).repeat(3))
+        b = a.navigate(key(tui::input::Kind::Up).repeat(1))
+        {offset_at_3: a.offset, offset_after_up: b.offset}
+    std::test::value("list: the window scrolls only when the selection leaves it", {offset_at_3: 2, offset_after_up: 2}, scrolling_offset)
+
+    fn empty_list():
+        l = tui::widgets::list_state([])
+        a = l.navigate([key(tui::input::Kind::Down), key(tui::input::Kind::End), key(tui::input::Kind::PageUp)])
+        {selected: a.selected, item: a.selected_item(), picture: picture(6, 2, a.list_node(2, true, plain(), plain().reverse()))}
+    std::test::value("list: an empty list has no selection and renders nothing", {selected: -1, item: "", picture: ["      ", "      "]}, empty_list)
+
+    fn modifiers_ignored():
+        l = tui::widgets::list_state(names())
+        l.navigate([key(tui::input::Kind::Down).with_ctrl(), key(tui::input::Kind::Down).with_alt()]).selected
+    std::test::value("list: Ctrl/Alt arrows are left to the application", 0, modifiers_ignored)
+
+    fn replace_items():
+        l = tui::widgets::list_state(names()).navigate([key(tui::input::Kind::End)])
+        a = l.list_replace([s('x'), s('y')])
+        b = l.list_replace([])
+        {selected: a.selected, item: a.selected_item(), emptied: b.selected}
+    std::test::value("list: replacing the items keeps the selection in range", {selected: 1, item: s('y'), emptied: -1}, replace_items)
+
+    fn rendering():
+        l = tui::widgets::list_state(names()).with_page(3)
+        a = l.navigate([key(tui::input::Kind::Down)])
+        {focused: picture(9, 3, a.list_node(3, true, plain(), plain().reverse())), short: picture(9, 2, a.list_node(2, true, plain(), plain().reverse()))}
+    std::test::value("list: rendering with a marker on the selected row", {focused: ["  one    ", "> two    ", "  three  "], short: ["  one    ", "> two    "]}, rendering)
+
+    fn rendering_scrolled():
+        l = tui::widgets::list_state(names()).with_page(2)
+        a = l.navigate(key(tui::input::Kind::Down).repeat(4))
+        picture(9, 2, a.list_node(2, true, plain(), plain().reverse()))
+    std::test::value("list: the window keeps the selected row visible", ["  four   ", "> five   "], rendering_scrolled)
+
+    fn highlight_bar():
+        l = tui::widgets::list_state(names())
+        shown = tui::canvas::new(8, 2).draw(l.list_node(2, true, plain(), plain().reverse())).rasterize()
+        {selected_tail: shown.attrs_at(7, 0), other: shown.attrs_at(7, 1), unfocused: tui::canvas::new(8, 2).draw(l.list_node(2, false, plain(), plain().reverse())).rasterize().attrs_at(0, 0)}
+    std::test::value("list: the focused selection is a full-width highlight bar", {selected_tail: 16, other: 0, unfocused: 1}, highlight_bar)
+
+    fn zero_height():
+        picture(5, 1, tui::widgets::list_state(names()).list_node(0, true, plain(), plain()))
+    std::test::value("list: zero height renders no rows", ["     "], zero_height)
+
+fn register_all():
+    reg_focus()
+    reg_button()
+    reg_text_input()
+    reg_list()
+
+with context std::test::suite()
+register_all()
+std::test::report()

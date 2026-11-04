@@ -1,0 +1,10 @@
+import std::io
+import std::linux::io
+
+fn hello():
+    std::io::print_line("Hello, world!"):
+        on std::io::WriteFailed:
+            unit
+
+with context std::linux::io::create()
+hello()

@@ -1,0 +1,31 @@
+test_canvas.bot    interp             43 passed, 0 failed         5.8s
+test_canvas.bot    compile            43 passed, 0 failed         5.1s
+test_canvas.bot    cranelift          43 passed, 0 failed         6.4s
+test_canvas.bot    cranelift-generic  43 passed, 0 failed         5.3s
+test_ansi.bot      interp             21 passed, 0 failed        45.6s
+test_ansi.bot      compile            21 passed, 0 failed         7.5s
+test_ansi.bot      cranelift          21 passed, 0 failed         7.1s
+test_ansi.bot      cranelift-generic  21 passed, 0 failed         6.2s
+test_input.bot     interp             34 passed, 0 failed        71.8s
+test_input.bot     compile            34 passed, 0 failed         7.7s
+test_input.bot     cranelift          34 passed, 0 failed         7.2s
+test_input.bot     cranelift-generic  34 passed, 0 failed         6.2s
+test_layout.bot    interp             21 passed, 0 failed        10.1s
+test_layout.bot    compile            21 passed, 0 failed         8.4s
+test_layout.bot    cranelift          21 passed, 0 failed        10.4s
+test_layout.bot    cranelift-generic  21 passed, 0 failed         8.6s
+test_widgets.bot   interp             29 passed, 0 failed         9.7s
+test_widgets.bot   compile            29 passed, 0 failed         8.7s
+test_widgets.bot   cranelift          29 passed, 0 failed        13.0s
+test_widgets.bot   cranelift-generic  29 passed, 0 failed         9.9s
+test.bot           interp             19 passed, 0 failed        17.9s
+test.bot           compile            19 passed, 0 failed        13.4s
+test.bot           cranelift          19 passed, 0 failed        18.2s
+test.bot           cranelift-generic  19 passed, 0 failed        13.8s
+menu_test.bot      interp             3 passed, 0 failed          9.9s
+menu_test.bot      compile            3 passed, 0 failed          9.3s
+menu_test.bot      cranelift          3 passed, 0 failed         11.3s
+menu_test.bot      cranelift-generic  3 passed, 0 failed          9.7s
+test_session.bot   cranelift          2 passed, 0 failed
+test_session.bot   cranelift-generic  2 passed, 0 failed
+test_session.bot   interp             (expected NATIVE-ONLY) == test_session.bot (interp)    error: std::abi::x86_64::from_mutable_bytes produces the machine address of a writable byte buffer, which exists only in the native backend (cranelift, or a standalone executable) on Linux x86-64; the Tcl backends (interp, compile) have no machine addresses and do not

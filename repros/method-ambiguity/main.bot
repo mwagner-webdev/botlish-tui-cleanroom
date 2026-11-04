@@ -1,0 +1,6 @@
+# A top-level binding named like an imported function breaks method syntax of that function.
+import lib
+
+screen = lib::Canvas {w: 1}.screen()
+other = lib::Canvas {w: 2}.screen()
+other.w

@@ -1,0 +1,109 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  BOT: ${{ github.workspace }}/botlish-linux-x86_64
+
+jobs:
+  test:
+    name: library tests (all backends)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Obtain the compiler
+        env:
+          BOTLISH_COMPILER_URL: ${{ secrets.BOTLISH_COMPILER_URL }}
+        run: |
+          if [ ! -f "$BOT" ]; then
+            if [ -z "$BOTLISH_COMPILER_URL" ]; then
+              echo "::error::No botlish-linux-x86_64 in the repository and no BOTLISH_COMPILER_URL secret"; exit 1
+            fi
+            curl -fsSL "$BOTLISH_COMPILER_URL" -o "$BOT"
+          fi
+          chmod +x "$BOT"
+          "$BOT" -version
+          sudo apt-get install -y bc >/dev/null
+      - name: Link the package into the authoring project
+        run: cd dev && "$BOT" install
+      - name: Portable tests, every backend
+        run: scripts/run_tests.sh "$PWD/dev" | tee test-results.txt
+      - name: Native-only adapter test (no terminal)
+        run: cd dev && "$BOT" -warnings error -backend cranelift test_session.bot < /dev/null | grep -q "2 passed, 0 failed"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: test-results.txt
+
+  pack:
+    name: deterministic package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Obtain the compiler
+        env:
+          BOTLISH_COMPILER_URL: ${{ secrets.BOTLISH_COMPILER_URL }}
+        run: |
+          if [ ! -f "$BOT" ]; then
+            [ -n "$BOTLISH_COMPILER_URL" ] || { echo "::error::no compiler"; exit 1; }
+            curl -fsSL "$BOTLISH_COMPILER_URL" -o "$BOT"
+          fi
+          chmod +x "$BOT"
+      - name: Pack twice and compare with the committed artifact
+        run: |
+          mkdir -p /tmp/p1 /tmp/p2
+          "$BOT" package pack tui -out /tmp/p1
+          touch tui/README.md
+          "$BOT" package pack tui -out /tmp/p2
+          sha256sum /tmp/p1/tui-0.1.0.botpkg /tmp/p2/tui-0.1.0.botpkg dist/tui-0.1.0.botpkg
+          cmp /tmp/p1/tui-0.1.0.botpkg /tmp/p2/tui-0.1.0.botpkg
+          cmp /tmp/p1/tui-0.1.0.botpkg dist/tui-0.1.0.botpkg
+          "$BOT" package inspect /tmp/p1/tui-0.1.0.botpkg > /dev/null
+
+  consumer:
+    name: consumer project and real-PTY acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Obtain the compiler
+        env:
+          BOTLISH_COMPILER_URL: ${{ secrets.BOTLISH_COMPILER_URL }}
+        run: |
+          if [ ! -f "$BOT" ]; then
+            [ -n "$BOTLISH_COMPILER_URL" ] || { echo "::error::no compiler"; exit 1; }
+            curl -fsSL "$BOTLISH_COMPILER_URL" -o "$BOT"
+          fi
+          chmod +x "$BOT"
+          sudo apt-get install -y bc >/dev/null
+      - name: Install the artifact and verify
+        working-directory: consumer
+        run: |
+          "$BOT" install
+          "$BOT" verify
+      - name: Installed files match the copies used by the consumer
+        working-directory: consumer
+        run: |
+          for f in taskapp demo test hello; do cmp $f.bot .bot_modules/tui/examples/$f.bot; done
+          for f in test_canvas test_ansi test_input test_layout test_widgets test_session; do cmp $f.bot .bot_modules/tui/tests/$f.bot; done
+      - name: Consumer tests (fast backends)
+        run: |
+          cd consumer
+          for t in test_canvas test_ansi test_input test_layout test_widgets test menu_test; do
+            for be in compile cranelift cranelift-generic; do
+              out=$("$BOT" -warnings error -backend $be $t.bot < /dev/null 2>&1)
+              echo "$t $be: $(echo "$out" | grep -o '[0-9]* passed, [0-9]* failed' | tail -1)"
+              echo "$out" | grep -q " 0 failed" || { echo "$out" | head -20; exit 1; }
+            done
+          done
+      - name: Build the demo natively
+        working-directory: consumer
+        run: |
+          "$BOT" -warnings error -emit-native-executable demo.bot
+      - name: PTY acceptance (external driver, 26 checks)
+        working-directory: consumer
+        run: python3 -B .bot_modules/tui/tests/pty_acceptance.py ./demo

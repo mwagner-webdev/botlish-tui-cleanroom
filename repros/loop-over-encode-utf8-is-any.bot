@@ -1,0 +1,18 @@
+# `loop b in bs` over a bound `s.encode_utf8()` yields `any` elements, while bs.at(i) keeps List[Byte]'s element type.
+import std::str
+import std::list
+
+fn widen(x: int) -> int:
+    x
+
+fn viaat(s: str) -> List[int]:
+    bs = s.encode_utf8()
+    loop i from 0 to bs.length():
+        widen(bs.at(i))
+
+fn vialoop(s: str) -> List[int]:
+    bs = s.encode_utf8()
+    loop b in bs:
+        widen(b)
+
+viaat("ab")

@@ -1,0 +1,64 @@
+direct module
+import std::io
+import std::str
+import std::linux::io
+import std::int
+import std::list
+import std::abi
+import std::abi::bytes
+import std::abi::x86_64
+import std::binary
+import std::linux::abi::x86_64
+
+layout Termios:
+    size 64
+    align 4
+    field iflag: std::binary::U32 at 0
+    field oflag: std::binary::U32 at 4
+    field cflag: std::binary::U32 at 8
+    field lflag: std::binary::U32 at 12
+    field rest: array 48 of std::binary::U8 at 16
+
+layout Winsize:
+    size 8
+    align 2
+    field rows: std::binary::U16 at 0
+    field cols: std::binary::U16 at 2
+    field xp: std::binary::U16 at 4
+    field yp: std::binary::U16 at 6
+
+struct IoctlResult:
+    result: int
+    data: std::abi::bytes::Bytes
+
+fn ioctl(fd: int, request: int, size: int) -> IoctlResult errors std::abi::AbiIntegerAboveRange, std::abi::AbiIntegerBelowRange, std::abi::x86_64::Register64AboveRange, std::abi::x86_64::Register64BelowRange:
+    buf = std::abi::bytes::detach(std::abi::bytes::zeroed(std::abi::usize(size)))
+    addr = std::abi::x86_64::from_mutable_bytes(buf)
+    r = std::linux::abi::x86_64::syscall({
+        rax: std::abi::x86_64::register64(16),
+        rdi: std::abi::x86_64::register64(fd),
+        rsi: std::abi::x86_64::register64(request),
+        rdx: addr,
+    })
+    IoctlResult {result: std::abi::x86_64::to_int(r), data: std::abi::bytes::freeze(buf)}
+
+fn report(label: str, r: IoctlResult):
+    std::io::print_line(label.concat(" -> ").concat(std::int::to_string(r.result))):
+        on std::io::WriteFailed:
+            unit
+
+fn main():
+    t = ioctl(0, 21505, 64):
+        on std::abi::AbiIntegerAboveRange:
+            return unit
+        on std::abi::AbiIntegerBelowRange:
+            return unit
+        on std::abi::x86_64::Register64AboveRange:
+            return unit
+        on std::abi::x86_64::Register64BelowRange:
+            return unit
+    report("TCGETS", t)
+    unit
+
+with context std::linux::io::create()
+main()

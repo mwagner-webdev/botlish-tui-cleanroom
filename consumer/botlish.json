@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "name": "consumer",
+  "version": "0.1.0",
+  "dependencies": {
+    "tui": "0.1"
+  },
+  "lock": {
+    "tui": "0.1.0"
+  },
+  "sources": {
+    "tui": {
+      "archive": "../dist/tui-0.1.0.botpkg",
+      "sha256": "d442e0d42e18343de43c4cea2345202f0bcbc08267310a4c439a7173413d0ffa"
+    }
+  }
+}

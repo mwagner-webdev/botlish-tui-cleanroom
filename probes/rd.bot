@@ -1,0 +1,16 @@
+import std::abi
+import std::abi::bytes
+import std::linux::io
+import std::io
+import std::int
+
+fn first_bytes(context io: std::linux::io::LinuxIO) -> int:
+    r = std::linux::io::read(std::abi::bytes::zeroed(std::abi::usize(16)))
+    r.result
+
+with context std::linux::io::create()
+n = first_bytes()
+std::io::print_line(std::int::to_string(n)):
+    on std::io::WriteFailed:
+        unit
+n

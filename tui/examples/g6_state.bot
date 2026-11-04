@@ -1,0 +1,40 @@
+# GUIDE 6: application state transitions. state + event -> next state;
+# state + dimensions -> canvas. A counter, no terminal.
+import std::int
+import std::str
+import tui::app
+import tui::style
+import tui::canvas
+import tui::input
+import tui::layout
+
+struct Counter:
+    value: int
+    done: bool
+
+fn update(app: Counter, event: tui::input::Event) -> Counter:
+    if event.is_char?(113):
+        return Counter {value: app.value, done: true}
+    if event.is_key?(tui::input::Kind::Up):
+        return Counter {value: app.value + 1, done: false}
+    if event.is_key?(tui::input::Kind::Down):
+        return Counter {value: app.value - 1, done: false}
+    app
+
+fn view(app: Counter, width: int, height: int) -> tui::canvas::Canvas:
+    label = tui::layout::label("count: ".concat(std::int::to_string(app.value)), tui::style::plain().bold())
+    tui::canvas::new(width, height).draw(tui::layout::vstack([label]))
+
+fn finished?(app: Counter) -> bool:
+    app.done
+
+# Drive it with decoded events -- exactly what tui::session::run does with a terminal.
+events = tui::input::decode_text("jkq")
+fn run_all(app: Counter, keys: List[tui::input::Event]) -> Counter:
+    fold e in keys with intermediate acc app:
+        acc.update(e)
+
+# (arrow keys need ESC: build them with tui::input::key)
+keys = [tui::input::key(tui::input::Kind::Up), tui::input::key(tui::input::Kind::Up), tui::input::key(tui::input::Kind::Down), tui::input::char_event(113)]
+final = (Counter {value: 0, done: false}).run_all(keys)
+{final: final, frame: final.view(14, 2).rasterize().lines(), finished: final.finished?()}

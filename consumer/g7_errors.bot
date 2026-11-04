@@ -1,0 +1,17 @@
+# GUIDE 7: errors are declared, never panics.
+import tui::canvas
+import tui::style
+
+plain = tui::style::plain()
+screen = tui::canvas::new(3, 2).rasterize()
+
+# Reading outside the screen is the declared error OutOfBounds ...
+fn char_at(x: int, y: int) -> int:
+    screen.cell_at(x, y):
+        on tui::canvas::OutOfBounds:
+            return -1
+    0
+
+# ... while *drawing* outside is clipped and never an error.
+drawn = tui::canvas::new(3, 2).text(100, 100, "far away", plain).text(-100, 0, "xy", plain).rasterize().lines()
+{inside: char_at(1, 1), outside: char_at(9, 9), negative_size: tui::canvas::new(-4, 2).width, clipped_drawing: drawn}

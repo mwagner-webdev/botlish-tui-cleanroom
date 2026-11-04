@@ -1,0 +1,13 @@
+# GUIDE 1: canvas, geometry and clipping.
+import tui::style
+import tui::canvas
+
+plain = tui::style::plain()
+
+# A canvas is a list of drawing operations; nothing is drawn until `rasterize`.
+# Operations apply in order: a later one overwrites an earlier one.
+inner = tui::canvas::rect(1, 1, 14, 3)
+canvas = tui::canvas::new(16, 5).border(tui::canvas::rect(0, 0, 16, 5), tui::canvas::BorderKind::Single, plain).text_in(inner, 2, 1, "clipped to the inner box", plain).text_in(inner, -3, 3, "left part cut", plain).text(4, 2, "later wins", plain.bold())
+
+# Everything outside the canvas (or a clip rectangle) is simply not drawn.
+canvas.rasterize().lines()

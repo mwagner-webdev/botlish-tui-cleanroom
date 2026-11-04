@@ -1,0 +1,43 @@
+# demo -- run the task list in a real terminal.
+#
+#   botlish -backend cranelift demo.bot            (or build an executable:)
+#   botlish -emit-native-executable demo.bot && ./demo
+#
+# Layer B (tui::session) needs a native backend on Linux x86-64 and a real
+# terminal.  Without a terminal the demo falls back to printing one frame as
+# plain text; Ctrl+X makes the application fail on purpose, to show that the
+# terminal is restored before the error message is printed.
+
+import std::io
+import std::linux::io
+import std::list
+import std::str
+import taskapp
+import tui::app
+import tui::canvas
+import tui::session
+
+fn say(text: str):
+    std::io::print_line(text):
+        on std::io::WriteFailed:
+            unit
+
+fn print_lines(lines: List[str]):
+    loop line in lines:
+        say(line)
+    unit
+
+fn frame_as_text() -> unit:
+    print_lines(taskapp::initial().view(60, 16).rasterize().lines())
+
+with context std::linux::io::create()
+with context tui::session::create()
+tui::session::run(taskapp::initial()):
+    on tui::session::NotATerminal {stream}:
+        say("demo: standard ".concat(stream).concat(" is not a terminal; showing one frame as plain text:"))
+        frame_as_text()
+    on tui::session::IoFailed {operation}:
+        say("demo: terminal I/O failed during: ".concat(operation))
+    on tui::app::Abort {reason}:
+        say("demo: the application failed: ".concat(reason))
+say("demo: finished; the terminal has been restored")

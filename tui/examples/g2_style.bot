@@ -1,0 +1,14 @@
+# GUIDE 2: styles and ANSI output as data.
+import tui::style
+import tui::canvas
+import tui::ansi
+
+plain = tui::style::plain()
+warning = plain.bold().with_fg(tui::style::yellow).with_bg(tui::style::red)
+
+screen = tui::canvas::new(8, 1).text(1, 0, "WARN", warning).rasterize()
+
+# ansi::full redraws everything; ansi::diff(previous, next) is the update.
+# `visible` shows each ESC as \e so the bytes can be read and compared.
+changed = tui::canvas::new(8, 1).text(1, 0, "WARN", warning).text(6, 0, "ok", plain).rasterize()
+{full: tui::ansi::visible(tui::ansi::full(screen)), update: tui::ansi::visible(screen.diff(changed)), unchanged: screen.diff(screen)}

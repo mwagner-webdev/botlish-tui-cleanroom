@@ -1,0 +1,16 @@
+# GUIDE 3: layout. One description, two sizes; the rectangles it computes.
+import tui::style
+import tui::canvas
+import tui::layout
+
+plain = tui::style::plain()
+
+fn ui() -> tui::layout::Node:
+    toolbar = tui::layout::hstack([tui::layout::label("File", plain), tui::layout::label(" Edit", plain), tui::layout::spacer(), tui::layout::label("v1", plain.dim())])
+    editor = tui::layout::label("text goes here", plain).boxed("editor", tui::canvas::BorderKind::Double, plain).with_flex(2)
+    log = tui::layout::label("log", plain).boxed("log", tui::canvas::BorderKind::Ascii, plain).with_flex(1)
+    tui::layout::vstack([toolbar, editor, log])
+
+small = tui::canvas::new(24, 8).draw(ui()).rasterize().lines()
+tall = tui::canvas::new(24, 11).draw(ui()).rasterize().lines()
+{small: small, tall: tall, rects_24x8: ui().rects(tui::canvas::rect(0, 0, 24, 8))}

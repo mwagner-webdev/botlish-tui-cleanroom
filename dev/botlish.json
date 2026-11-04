@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "name": "dev",
+  "version": "0.0.0",
+  "dependencies": {
+    "tui": "0.1"
+  },
+  "sources": {
+    "tui": {
+      "directory": "../tui"
+    }
+  }
+}

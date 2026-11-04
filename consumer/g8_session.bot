@@ -1,0 +1,51 @@
+# GUIDE 10: the smallest terminal program. Up/Down change a counter, q quits.
+#
+#   botlish -emit-native-executable g8_session.bot && ./g8_session      (in a terminal)
+import std::io
+import std::int
+import std::str
+import std::linux::io
+import tui::app
+import tui::canvas
+import tui::input
+import tui::layout
+import tui::session
+import tui::style
+
+struct Counter:
+    value: int
+    done: bool
+
+fn update(app: Counter, event: tui::input::Event) -> Counter:
+    if event.is_char?(113):
+        return Counter {value: app.value, done: true}
+    if event.is_key?(tui::input::Kind::Up):
+        return Counter {value: app.value + 1, done: false}
+    if event.is_key?(tui::input::Kind::Down):
+        return Counter {value: app.value - 1, done: false}
+    app
+
+fn view(app: Counter, width: int, height: int) -> tui::canvas::Canvas:
+    plain = tui::style::plain()
+    count = tui::layout::label("count: ".concat(std::int::to_string(app.value)), plain.bold())
+    help = tui::layout::label("Up/Down change the count, q quits", plain.dim())
+    tui::canvas::new(width, height).draw(tui::layout::vstack([count, help]))
+
+fn finished?(app: Counter) -> bool:
+    app.done
+
+fn say(text: str):
+    std::io::print_line(text):
+        on std::io::WriteFailed:
+            unit
+
+with context std::linux::io::create()
+with context tui::session::create()
+tui::session::run(Counter {value: 0, done: false}):
+    on tui::session::NotATerminal {stream}:
+        say("g8_session: standard ".concat(stream).concat(" is not a terminal"))
+    on tui::session::IoFailed {operation}:
+        say("g8_session: terminal I/O failed: ".concat(operation))
+    on tui::app::Abort {reason}:
+        say("g8_session: ".concat(reason))
+say("g8_session: bye")

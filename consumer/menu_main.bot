@@ -1,0 +1,21 @@
+import std::io
+import std::linux::io
+import std::str
+import menu
+import tui::app
+import tui::session
+
+fn say(text: str):
+    std::io::print_line(text):
+        on std::io::WriteFailed:
+            unit
+
+with context std::linux::io::create()
+with context tui::session::create()
+tui::session::run(menu::initial()):
+    on tui::session::NotATerminal {stream}:
+        say("menu: standard ".concat(stream).concat(" is not a terminal"))
+    on tui::session::IoFailed {operation}:
+        say("menu: I/O failed: ".concat(operation))
+    on tui::app::Abort {reason}:
+        say("menu: ".concat(reason))

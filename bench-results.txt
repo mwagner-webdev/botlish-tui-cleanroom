@@ -1,0 +1,21 @@
+Benchmark: tui/examples/bench.bot built with `-emit-native-executable` (cranelift), host Linux x86-64.
+No clock exists in the standard library: wall time of the whole process (python time.perf_counter around subprocess),
+5 runs per row (3 for the scaling rows), median [min..max]; start-up (repeat 0) = 0.0023 s subtracted.
+
+1 render 80x24: layout->canvas->rasterize->full ANSI   repeat=100  median 0.154s [0.152..0.173]  => 1.52 ms/iteration
+2 nested layouts (8 levels) 80x24                      repeat=100  median 0.091s [0.089..0.092]  => 0.88 ms/iteration
+3 view+rasterize+diff, small change, 80x24             repeat=100  median 0.113s [0.112..0.117]  => 1.11 ms/iteration
+4 decode 10000 key events (1000 blocks x 10 events per iteration)
+                                                       repeat=20   median 0.248s [0.233..0.253]  => 12.3 ms/iteration (1.2 us/event)
+5 58 widget transitions (28 text edits + 30 list moves) repeat=200 median 0.011s [0.011..0.025]  => 0.045 ms/iteration (0.8 us/transition)
+
+Scaling (SCALE multiplies width, height and row count; area x SCALE^2):
+workload 1 render : scale1 2.02 ms, scale2 3.44 ms, scale4 8.88 ms
+workload 3 diff   : scale1 1.13 ms, scale2 2.66 ms, scale4 7.11 ms
+workload 4 decode : scale1 12.09 ms (10k events), scale2 27.45 ms (20k), scale4 74.89 ms (40k)   <- mildly superlinear (1.2 -> 1.9 us/event)
+
+Other backends, workload 1 (one 80x24 frame render + ANSI), per iteration:
+  cranelift-generic (repeat300 - repeat0): 1.47 ms      cranelift run in-process: 2-4 ms (noisy, +-1 s compile jitter)
+  compile (Tcl)    : ~1.7 s  (9.4 s for 5 repeats incl. ~1 s start-up)
+  interp           : ~12 s   (60.3 s for 5 repeats)
+=> the Tcl backends are fine for the test suite's small screens and unusable for real-size rendering.

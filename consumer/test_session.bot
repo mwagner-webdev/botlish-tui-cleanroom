@@ -1,0 +1,65 @@
+# Layer B tests that need no terminal: the adapter's behaviour when stdin or
+# stdout is NOT a terminal.  Native backends only (the adapter uses raw
+# syscalls); run it with its standard input redirected:
+#
+#   botlish -backend cranelift test_session.bot < /dev/null
+#
+# Real-terminal behaviour (raw mode, resize, restore) is tested by
+# pty_acceptance.py, which drives a built executable inside a pseudo-terminal.
+import std::list
+import std::str
+import std::test
+import tui::app
+import tui::canvas
+import tui::input
+import tui::session
+
+# A do-nothing application, to hand to run.
+struct Idle:
+    ticks: int
+
+fn update(app: Idle, event: tui::input::Event) -> Idle:
+    Idle {ticks: app.ticks + 1}
+
+fn view(app: Idle, width: int, height: int) -> tui::canvas::Canvas:
+    tui::canvas::new(width, height)
+
+fn finished?(app: Idle) -> bool:
+    app.ticks > 0
+
+fn run_outcome(context term: tui::session::Terminal) -> str:
+    tui::session::run(Idle {ticks: 0}):
+        on tui::session::NotATerminal {stream}:
+            return "not a terminal: ".concat(stream)
+        on tui::session::IoFailed {operation}:
+            return "io failed: ".concat(operation)
+        on tui::app::Abort {reason}:
+            return "aborted: ".concat(reason)
+    "ran"
+
+fn size_outcome(context term: tui::session::Terminal) -> str:
+    tui::session::size():
+        on tui::session::NotATerminal {stream}:
+            return "not a terminal: ".concat(stream)
+    "size"
+
+# Test bodies cannot require a context, so the outcomes are computed at the top
+# level (where the Terminal context is installed) and the cases capture them.
+fn reg_session(on_terminal: bool, run_result: str, size_result: str):
+    fn constants():
+        {escape_ms: tui::session::escape_timeout_ms, resize_ms: tui::session::resize_poll_ms}
+    std::test::value("session: documented timing constants", {escape_ms: 50, resize_ms: 100}, constants)
+
+    fn consistent_without_a_terminal():
+        if on_terminal:
+            return "skipped: stdin and stdout are a terminal"
+        "".concat(run_result).concat(" | ").concat(size_result)
+    std::test::value("session: without a terminal, run and size fail with NotATerminal naming the stream, and touch nothing", "not a terminal: input | not a terminal: output", consistent_without_a_terminal)
+
+with context std::test::suite()
+with context tui::session::create()
+on_terminal = tui::session::tty?()
+run_result = run_outcome()
+size_result = size_outcome()
+on_terminal.reg_session(run_result, size_result)
+std::test::report()

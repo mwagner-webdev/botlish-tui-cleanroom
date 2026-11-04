@@ -1,0 +1,17 @@
+# GUIDE 5: the input decoder is pure and incremental.
+import std::list
+import tui::input
+
+# Bytes as a terminal sends them: "a", ESC [ A (Up), "b" ... split across reads.
+chunk1 = [97, 27, 91]
+chunk2 = [65, 98, 27]
+
+first = tui::input::new_decoder().feed(chunk1)
+second = first.decoder.feed(chunk2)
+
+# ESC alone is ambiguous: the decoder holds it until more input arrives or you
+# flush (tui::session flushes after 50 ms of silence).
+held = second.decoder.pending?()
+resolved = tui::input::flush(second.decoder)
+
+{after_first_read: first.events.length(), after_second_read: second.events, still_pending: held, after_flush: resolved.events}

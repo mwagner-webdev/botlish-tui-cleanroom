@@ -1,0 +1,303 @@
+# tui::layout -- immutable layout descriptions and their rendering.
+#
+# A layout is a tree of Nodes built with the functions below.  It knows
+# nothing about the terminal: the available area is data (a Rect, or the size
+# of a Canvas), so the same description renders at any size and is testable
+# without a terminal.
+#
+# Sizing rules
+#   * Every node has a natural size: a label is its text width by 1 row; a
+#     vertical stack is as wide as its widest child and as tall as its
+#     children together; a horizontal stack the reverse; a box adds 1 cell on
+#     every side (and at least the title's width + 4); padding adds its
+#     insets; spacers and fills have natural size 0.
+#   * with_width / with_height replace the natural size on that axis.
+#   * with_flex(n) (n > 0) makes a node take a share of the space left over
+#     on the main axis of its stack: shares are proportional to the weights
+#     and add up to exactly the leftover space (integer remainders are spread
+#     deterministically, earlier children first).  A flex child ignores its
+#     natural size on the main axis.
+#   * Insufficient space: fixed-size children are served in order and the
+#     later ones are truncated (down to 0 cells); flex children get 0.
+#     Spare space with no flex child stays empty (at the end of the stack).
+#   * On the cross axis a child gets the whole extent, or its with_width /
+#     with_height if that is smaller.
+#   * Everything a node draws is clipped to the node's own rectangle, and a
+#     rectangle with no area draws nothing.
+
+import std::list
+import std::str
+import tui::style
+import tui::text
+import tui::canvas
+
+enum Kind:
+    Label,
+    Spacer,
+    Fill,
+    VStack,
+    HStack,
+    Box,
+    Pad,
+    Backdrop,
+
+tree struct Node:
+    kind: Kind
+    text: str
+    style: tui::style::Style
+    border: tui::canvas::BorderKind
+    width: int
+    height: int
+    flex: int
+    pad_left: int
+    pad_top: int
+    pad_right: int
+    pad_bottom: int
+    children: List[Node]
+
+struct Size:
+    w: int
+    h: int
+
+private nomethod fn make(kind: Kind, text: str, style: tui::style::Style, flex: int, children: List[Node]) -> Node:
+    Node {kind: kind, text: text, style: style, border: tui::canvas::BorderKind::Single, width: -1, height: -1, flex: flex, pad_left: 0, pad_top: 0, pad_right: 0, pad_bottom: 0, children: children}
+
+# One line of text (clipped, never wrapped).
+nomethod fn label(text: str, style: tui::style::Style) -> Node:
+    make(Kind::Label, text, style, 0, [])
+
+# Empty space that takes a share of the leftover room (flex 1).
+fn spacer() -> Node:
+    make(Kind::Spacer, "", tui::style::plain(), 1, [])
+
+# A flexible rectangle filled with spaces in STYLE.
+nomethod fn fill(style: tui::style::Style) -> Node:
+    make(Kind::Fill, "", style, 1, [])
+
+nomethod fn vstack(children: List[Node]) -> Node:
+    make(Kind::VStack, "", tui::style::plain(), 0, children)
+
+nomethod fn hstack(children: List[Node]) -> Node:
+    make(Kind::HStack, "", tui::style::plain(), 0, children)
+
+# CHILD inside a border of KIND drawn in STYLE; TITLE (may be "") sits on the top edge.
+fn boxed(child: Node, title: str, kind: tui::canvas::BorderKind, style: tui::style::Style) -> Node:
+    n = make(Kind::Box, title, style, 0, [child])
+    Node {kind: n.kind, text: n.text, style: n.style, border: kind, width: -1, height: -1, flex: 0, pad_left: 0, pad_top: 0, pad_right: 0, pad_bottom: 0, children: n.children}
+
+fn padded(child: Node, left: int, top: int, right: int, bottom: int) -> Node:
+    Node {kind: Kind::Pad, text: "", style: tui::style::plain(), border: tui::canvas::BorderKind::Single, width: -1, height: -1, flex: 0, pad_left: left, pad_top: top, pad_right: right, pad_bottom: bottom, children: [child]}
+
+fn padded_all(child: Node, amount: int) -> Node:
+    child.padded(amount, amount, amount, amount)
+
+# CHILD drawn over a rectangle filled with STYLE (a background colour).
+fn on_color(child: Node, style: tui::style::Style) -> Node:
+    make(Kind::Backdrop, "", style, 0, [child])
+
+fn with_width(node: Node, width: int) -> Node:
+    Node {kind: node.kind, text: node.text, style: node.style, border: node.border, width: width, height: node.height, flex: node.flex, pad_left: node.pad_left, pad_top: node.pad_top, pad_right: node.pad_right, pad_bottom: node.pad_bottom, children: node.children}
+
+fn with_height(node: Node, height: int) -> Node:
+    Node {kind: node.kind, text: node.text, style: node.style, border: node.border, width: node.width, height: height, flex: node.flex, pad_left: node.pad_left, pad_top: node.pad_top, pad_right: node.pad_right, pad_bottom: node.pad_bottom, children: node.children}
+
+fn with_flex(node: Node, weight: int) -> Node:
+    Node {kind: node.kind, text: node.text, style: node.style, border: node.border, width: node.width, height: node.height, flex: weight, pad_left: node.pad_left, pad_top: node.pad_top, pad_right: node.pad_right, pad_bottom: node.pad_bottom, children: node.children}
+
+private fn sum(xs: List[int]) -> int:
+    fold x in xs with intermediate acc 0:
+        acc + x
+
+private fn widest(xs: List[int]) -> int:
+    fold x in xs with intermediate acc 0:
+        if x > acc:
+            x
+        else:
+            acc
+
+private fn sum_first(xs: List[int], n: int) -> int:
+    parts = loop i from 0 to n:
+        xs.get(i, 0)
+    sum(parts)
+
+private fn nonneg(n: int) -> int:
+    if n < 0:
+        return 0
+    n
+
+private nomethod fn quotient_bits(a: int, b: int, bit: int, acc: int) -> int:
+    if bit < 0:
+        return acc
+    scaled = b.shift_left(bit)
+    if a >= scaled:
+        return quotient_bits(a - scaled, b, bit - 1, acc + shift_left(1, bit))
+    quotient_bits(a, b, bit - 1, acc)
+
+private nomethod fn top_bit(a: int, b: int, bit: int) -> int:
+    if b.shift_left(bit + 1) > a:
+        return bit
+    top_bit(a, b, bit + 1)
+
+# Floor of A / B for A >= 0, B > 0 (0 for any other input).
+private nomethod fn quotient(a: int, b: int) -> int:
+    if a <= 0 or b <= 0 or a < b:
+        return 0
+    quotient_bits(a, b, top_bit(a, b, 0), 0)
+
+private fn natural_size(node: Node, ws: List[int], hs: List[int]) -> Size:
+    if node.kind == Kind::Label:
+        return Size {w: tui::text::width(node.text), h: 1}
+    if node.kind == Kind::VStack:
+        return Size {w: widest(ws), h: sum(hs)}
+    if node.kind == Kind::HStack:
+        return Size {w: sum(ws), h: widest(hs)}
+    if node.kind == Kind::Box:
+        title = nonneg(tui::text::width(node.text) + 4)
+        inner_w = widest(ws) + 2
+        inner = if inner_w > title:
+            inner_w
+        else:
+            title
+        return Size {w: inner, h: widest(hs) + 2}
+    if node.kind == Kind::Pad:
+        return Size {w: widest(ws) + node.pad_left + node.pad_right, h: widest(hs) + node.pad_top + node.pad_bottom}
+    if node.kind == Kind::Backdrop:
+        return Size {w: widest(ws), h: widest(hs)}
+    Size {w: 0, h: 0}
+
+# The natural size of NODE.
+fn measure(node: Node) -> Size:
+    sizes = loop c in node.children:
+        measure(c)
+    ws = loop s in sizes:
+        s.w
+    hs = loop s in sizes:
+        s.h
+    natural = node.natural_size(ws, hs)
+    w = if node.width >= 0:
+        node.width
+    else:
+        natural.w
+    h = if node.height >= 0:
+        node.height
+    else:
+        natural.h
+    Size {w: w, h: h}
+
+# Share out TOTAL cells among children: WANTS are natural sizes, FLEXES the
+# weights (0 = not flexible).  The result has one size per child.
+private nomethod fn allocate(wants: List[int], flexes: List[int], total: int) -> List[int]:
+    n = wants.length()
+    effective = loop i from 0 to n:
+        if flexes.get(i, 0) > 0:
+            0
+        else:
+            nonneg(wants.get(i, 0))
+    weights = loop i from 0 to n:
+        nonneg(flexes.get(i, 0))
+    fixed = sum(effective)
+    left = nonneg(total - fixed)
+    weight_sum = sum(weights)
+    loop i from 0 to n:
+        if weights.get(i, 0) > 0:
+            upto = quotient(left * weights.sum_first(i + 1), weight_sum)
+            before = quotient(left * weights.sum_first(i), weight_sum)
+            upto - before
+        else:
+            room = nonneg(total - effective.sum_first(i))
+            want = effective.get(i, 0)
+            if room < want:
+                room
+            else:
+                want
+
+private fn stack_rects(node: Node, rect: tui::canvas::Rect) -> List[tui::canvas::Rect]:
+    vertical = node.kind == Kind::VStack
+    n = node.children.length()
+    sizes = loop c in node.children:
+        measure(c)
+    wants = loop s in sizes:
+        if vertical:
+            s.h
+        else:
+            s.w
+    flexes = loop c in node.children:
+        c.flex
+    total = if vertical:
+        rect.h
+    else:
+        rect.w
+    grants = allocate(wants, flexes, total)
+    loop i from 0 to n:
+        offset = grants.sum_first(i)
+        grant = grants.get(i, 0)
+        cross = sizes.get(i, Size {w: 0, h: 0})
+        if vertical:
+            cross_w = if node.children.at(i).width >= 0 and cross.w < rect.w:
+                cross.w
+            else:
+                rect.w
+            tui::canvas::Rect {x: rect.x, y: rect.y + offset, w: cross_w, h: grant}
+        else:
+            cross_h = if node.children.at(i).height >= 0 and cross.h < rect.h:
+                cross.h
+            else:
+                rect.h
+            tui::canvas::Rect {x: rect.x + offset, y: rect.y, w: grant, h: cross_h}
+
+# The rectangles of NODE's children when NODE occupies RECT.
+private fn child_rects(node: Node, rect: tui::canvas::Rect) -> List[tui::canvas::Rect]:
+    if node.kind == Kind::VStack or node.kind == Kind::HStack:
+        return node.stack_rects(rect)
+    if node.kind == Kind::Box:
+        return [tui::canvas::Rect {x: rect.x + 1, y: rect.y + 1, w: nonneg(rect.w - 2), h: nonneg(rect.h - 2)}]
+    if node.kind == Kind::Pad:
+        inner_w = nonneg(rect.w - node.pad_left - node.pad_right)
+        inner_h = nonneg(rect.h - node.pad_top - node.pad_bottom)
+        return [tui::canvas::Rect {x: rect.x + node.pad_left, y: rect.y + node.pad_top, w: inner_w, h: inner_h}]
+    if node.kind == Kind::Backdrop:
+        return [rect]
+    []
+
+private fn own_ops(node: Node, rect: tui::canvas::Rect, clip: tui::canvas::Rect) -> List[tui::canvas::Op]:
+    if node.kind == Kind::Label:
+        return [tui::canvas::op_text(clip, rect.x, rect.y, node.text, node.style)]
+    if node.kind == Kind::Fill or node.kind == Kind::Backdrop:
+        return [tui::canvas::op_fill(clip, rect, node.style)]
+    if node.kind == Kind::Box:
+        edge = tui::canvas::op_border(clip, rect, node.border, node.style)
+        if tui::text::width(node.text) == 0 or rect.w < 5 or rect.h < 2:
+            return [edge]
+        title_clip = clip.intersect(tui::canvas::Rect {x: rect.x + 1, y: rect.y, w: rect.w - 2, h: 1})
+        title = tui::canvas::op_text(title_clip, rect.x + 2, rect.y, "".append_char(' ').concat(node.text).append_char(' '), node.style)
+        return [edge, title]
+    []
+
+# The drawing operations of NODE laid out in RECT, clipped to CLIP.
+private fn render(node: Node, rect: tui::canvas::Rect, clip: tui::canvas::Rect) -> List[tui::canvas::Op]:
+    visible = clip.intersect(rect)
+    if visible.empty?():
+        return []
+    rects = node.child_rects(rect)
+    nested = loop i from 0 to node.children.length():
+        node.children.at(i).render(rects.get(i, rect), visible)
+    [node.own_ops(rect, visible), nested.flat()].flat()
+
+# The drawing operations of NODE laid out in RECT.
+fn ops(node: Node, rect: tui::canvas::Rect) -> List[tui::canvas::Op]:
+    node.render(rect, rect)
+
+# Draw NODE into the whole canvas, on top of what is there.
+fn draw(canvas: tui::canvas::Canvas, node: Node) -> tui::canvas::Canvas:
+    canvas.add_all(node.ops(canvas.bounds()))
+
+# Draw NODE into RECT of the canvas (clipped to the canvas).
+fn draw_in(canvas: tui::canvas::Canvas, node: Node, rect: tui::canvas::Rect) -> tui::canvas::Canvas:
+    canvas.add_all(node.render(rect, canvas.bounds().intersect(rect)))
+
+# The rectangle of every node of the tree, in preorder (NODE first).
+fn rects(node: Node, rect: tui::canvas::Rect) -> List[tui::canvas::Rect]:
+    kids = node.child_rects(rect)
+    nested = loop i from 0 to node.children.length():
+        node.children.at(i).rects(kids.get(i, rect))
+    [[rect], nested.flat()].flat()

@@ -1,0 +1,143 @@
+# tui::text -- text safety and the display-width policy.
+#
+# The standard library exposes no character-width or grapheme facilities, so
+# this module does NOT claim to be Unicode-correct.  It supports an explicit
+# single-cell subset (see single_cell?) and replaces everything else with
+# U+FFFD, so a cell never silently disagrees with the terminal about width:
+#
+#   * C0/C1 control characters, DEL and the surrogates' neighbours are never
+#     passed to the terminal: they become U+FFFD (this is the escape-injection
+#     defence: an ESC inside application text is displayed as a replacement
+#     character, never sent as a control sequence);
+#   * combining marks, zero-width characters, East-Asian wide and fullwidth
+#     characters, emoji and every other code point outside the subset become
+#     U+FFFD as well.
+#
+# Text is handled as a List of Unicode scalar values (Ints).
+
+import std::list
+import std::str
+import std::abi::bytes
+import std::byte
+import std::char
+
+replacement = 65533
+
+# An Int as a plain Int (drops a refinement such as Byte from the type).
+fn widen(x: int) -> int:
+    x
+
+private fn byte_of(n: int) -> std::byte::Byte:
+    std::byte::from_int(n):
+        on std::byte::BelowRange:
+            std::byte::from_int(63)
+        on std::byte::AboveRange:
+            std::byte::from_int(63)
+
+private fn utf8_bytes(cp: int) -> List[std::byte::Byte]:
+    if cp < 128:
+        return [byte_of(cp)]
+    if cp < 2048:
+        return [byte_of(bit_or(192, cp.shift_right(6))), byte_of(bit_or(128, bit_and(cp, 63)))]
+    if cp < 65536:
+        return [byte_of(bit_or(224, cp.shift_right(12))), byte_of(bit_or(128, bit_and(cp.shift_right(6), 63))), byte_of(bit_or(128, bit_and(cp, 63)))]
+    [byte_of(bit_or(240, bit_and(cp.shift_right(18), 7))), byte_of(bit_or(128, bit_and(cp.shift_right(12), 63))), byte_of(bit_or(128, bit_and(cp.shift_right(6), 63))), byte_of(bit_or(128, bit_and(cp, 63)))]
+
+private fn raw_str(cp: int) -> str:
+    std::abi::bytes::decode_utf8(std::abi::bytes::from_list(utf8_bytes(cp))):
+        on InvalidUtf8:
+            ""
+
+printable_ascii = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+
+# The String holding exactly the scalar value CP ("" if CP is not a Unicode
+# scalar value).  Control characters are NOT filtered here: this is trusted
+# output used by the ANSI layer; use sanitize/from_codepoints for text.
+fn char_string(cp: int) -> str:
+    if cp < 0 or cp > 1114111 or (cp >= 55296 and cp < 57344):
+        return ""
+    raw_str(cp)
+
+# S followed by the scalar value CP, unfiltered (trusted output).
+fn append_code(s: str, cp: int) -> str:
+    if cp >= 32 and cp <= 126:
+        c = printable_ascii.char_at(cp - 32):
+            on IndexNotFound:
+                '?'
+        return s.append_char(c)
+    s.concat(char_string(cp))
+
+private fn payload(bs, k: int) -> int:
+    bit_and(bs.get(k, 0), 63)
+
+# The scalar values of S, without any filtering.
+fn raw_codepoints(s: str) -> List[int]:
+    bs = s.encode_utf8()
+    loop i from 0 to bs.length():
+        b0 = bs.at(i)
+        if b0 >= 128 and b0 < 192:
+            continue
+        if b0 < 128:
+            b0
+        elif b0 < 224:
+            bit_or(bit_and(b0, 31).shift_left(6), bs.payload(i + 1))
+        elif b0 < 240:
+            bit_or(bit_or(bit_and(b0, 15).shift_left(12), bs.payload(i + 1).shift_left(6)), bs.payload(i + 2))
+        else:
+            hi = bit_or(bit_and(b0, 7).shift_left(18), bs.payload(i + 1).shift_left(12))
+            bit_or(hi, bit_or(bs.payload(i + 2).shift_left(6), bs.payload(i + 3)))
+
+# True when CP is in the supported single-cell subset:
+#   U+0020-007E, U+00A1-00AC, U+00AE-02FF, U+0370-0482, U+048A-052F,
+#   U+1E00-1EFF, U+2010-2027, U+2190-21FF, U+2500-25FF, U+FFFD.
+fn single_cell?(cp: int) -> bool:
+    if cp >= 32 and cp <= 126:
+        return true
+    if cp >= 161 and cp <= 767:
+        return cp != 173
+    if cp >= 880 and cp <= 1154:
+        return true
+    if cp >= 1162 and cp <= 1327:
+        return true
+    if cp >= 7680 and cp <= 7935:
+        return true
+    if cp >= 8208 and cp <= 8231:
+        return true
+    if cp >= 8592 and cp <= 8703:
+        return true
+    if cp >= 9472 and cp <= 9727:
+        return true
+    cp == 65533
+
+# The code point actually displayed for CP: CP itself when it is in the
+# single-cell subset, U+0020 for U+00A0 (no-break space), else U+FFFD.
+fn displayed(cp: int) -> int:
+    if cp == 160:
+        return 32
+    if single_cell?(cp):
+        return cp
+    65533
+
+# S as the scalar values that will be displayed (one terminal cell each).
+fn codepoints(s: str) -> List[int]:
+    raw = raw_codepoints(s)
+    loop cp in raw:
+        displayed(cp)
+
+# Number of terminal cells S occupies (every displayed code point is one cell).
+fn width(s: str) -> int:
+    raw_codepoints(s).length()
+
+# The String made of the given scalar values after the same filtering as
+# codepoints.
+fn from_codepoints(cps: List[int]) -> str:
+    fold cp in cps with intermediate acc "":
+        acc.append_code(displayed(cp))
+
+# S with every unsupported or control character replaced (what the user sees).
+fn sanitize(s: str) -> str:
+    from_codepoints(raw_codepoints(s))
+
+# The scalar value of a character literal: code('q') == 113.
+fn code(c: UnicodeChar) -> int:
+    std::char::scalar_value(c)

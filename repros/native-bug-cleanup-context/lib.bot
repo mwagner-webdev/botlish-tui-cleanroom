@@ -1,0 +1,15 @@
+opaque context struct Cfg:
+    n: bool
+
+opaque resource struct Handle:
+    id: int
+
+fn get(context c: Cfg) -> bool:
+    c.n
+
+cleanup fn close(h: Handle, context c: Cfg):
+    {id} = h
+    get()
+    unit
+
+const_value = 5
