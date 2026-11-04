@@ -6,6 +6,9 @@ on:
 
 env:
   BOT: ${{ github.workspace }}/botlish-linux-x86_64
+  # Where the compiler is downloaded from when it is not in the repository.
+  # Override with the repository variable BOTLISH_COMPILER_URL if needed.
+  DEFAULT_COMPILER_URL: https://github.com/mwagner-webdev/botlish/releases/download/single-latest/botlish-linux-x86_64
 
 jobs:
   test:
@@ -16,12 +19,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Obtain the compiler
         env:
-          BOTLISH_COMPILER_URL: ${{ secrets.BOTLISH_COMPILER_URL }}
+          BOTLISH_COMPILER_URL: ${{ vars.BOTLISH_COMPILER_URL || env.DEFAULT_COMPILER_URL }}
         run: |
           if [ ! -f "$BOT" ]; then
-            if [ -z "$BOTLISH_COMPILER_URL" ]; then
-              echo "::error::No botlish-linux-x86_64 in the repository and no BOTLISH_COMPILER_URL secret"; exit 1
-            fi
             curl -fsSL "$BOTLISH_COMPILER_URL" -o "$BOT"
           fi
           chmod +x "$BOT"
@@ -46,13 +46,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Obtain the compiler
         env:
-          BOTLISH_COMPILER_URL: ${{ secrets.BOTLISH_COMPILER_URL }}
+          BOTLISH_COMPILER_URL: ${{ vars.BOTLISH_COMPILER_URL || env.DEFAULT_COMPILER_URL }}
         run: |
           if [ ! -f "$BOT" ]; then
-            [ -n "$BOTLISH_COMPILER_URL" ] || { echo "::error::no compiler"; exit 1; }
             curl -fsSL "$BOTLISH_COMPILER_URL" -o "$BOT"
           fi
           chmod +x "$BOT"
+          "$BOT" -version
       - name: Pack twice and compare with the committed artifact
         run: |
           mkdir -p /tmp/p1 /tmp/p2
@@ -72,13 +72,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Obtain the compiler
         env:
-          BOTLISH_COMPILER_URL: ${{ secrets.BOTLISH_COMPILER_URL }}
+          BOTLISH_COMPILER_URL: ${{ vars.BOTLISH_COMPILER_URL || env.DEFAULT_COMPILER_URL }}
         run: |
           if [ ! -f "$BOT" ]; then
-            [ -n "$BOTLISH_COMPILER_URL" ] || { echo "::error::no compiler"; exit 1; }
             curl -fsSL "$BOTLISH_COMPILER_URL" -o "$BOT"
           fi
           chmod +x "$BOT"
+          "$BOT" -version
           sudo apt-get install -y bc >/dev/null
       - name: Install the artifact and verify
         working-directory: consumer

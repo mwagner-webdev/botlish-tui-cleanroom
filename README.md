@@ -15,6 +15,7 @@ The Botlish compiler (`botlish-linux-x86_64`) is **not** in this repository. Put
 (or point `BOT` at it) before running anything:
 
 ```sh
+curl -fsSL https://github.com/mwagner-webdev/botlish/releases/download/single-latest/botlish-linux-x86_64 -o botlish-linux-x86_64
 chmod +x botlish-linux-x86_64
 (cd dev && ../botlish-linux-x86_64 install)
 BOT=$PWD/botlish-linux-x86_64 scripts/run_tests.sh $PWD/dev        # all backends, takes ~8 minutes
@@ -25,5 +26,9 @@ BOT=$PWD/botlish-linux-x86_64 scripts/run_tests.sh $PWD/dev        # all backend
 `.github/workflows/ci.yml` runs on every push and pull request: library tests on all four backends,
 a deterministic-pack check (packs twice and compares with `dist/tui-0.1.0.botpkg`), and the consumer project
 (install, verify, tests, native demo build, real-PTY acceptance). The compiler is taken from the repository root
-if present, otherwise downloaded from the URL stored in the repository secret `BOTLISH_COMPILER_URL`.
+if present, otherwise downloaded from
+`https://github.com/mwagner-webdev/botlish/releases/download/single-latest/botlish-linux-x86_64`
+(override with the repository variable `BOTLISH_COMPILER_URL`). That release is a moving target; the results in this
+repository were produced with the build reported by `-version` as source revision 2a10335, and every CI job prints the
+version it actually got.
 If you change anything under `tui/`, bump the version and repack: the pack check fails on a stale artifact.
