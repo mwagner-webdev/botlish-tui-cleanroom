@@ -7,6 +7,7 @@
 # Built executables and Python caches
 /consumer/demo
 /consumer/menu_main
+/consumer/g8_session
 /dev/demo
 /dev/bench
 __pycache__/
