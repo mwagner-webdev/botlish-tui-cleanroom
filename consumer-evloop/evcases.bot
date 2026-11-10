@@ -1,0 +1,223 @@
+# evcases -- lifecycle cases of tui_event_loop_linux, one per run, each printing
+# one "CASE name key=value ..." line after the terminal is restored.  A PTY
+# harness (pty_evcases.py) starts it with `--case NAME` and looks at the line
+# and at the terminal.  The application is examples/monitor.bot.
+#
+#   busy      a second owner of the terminal is refused, however it asks; the
+#             first one ends; ownership is free again; open and close, 3 times
+#   abandon   the loop abandons the UI task while it waits: the terminal is
+#             restored by the abandoned coroutine's cleanup
+#   shutdown  std::event_loop::shutdown revokes the inbox: the UI task ends
+#             with code 5 and restores the terminal
+#   stale     after the UI task ended every inbox operation says NotLive, the
+#             outcome stays, and a new session can be started
+#   flood     events are posted faster than the (undrained) terminal takes
+#             output; the loop then abandons the UI task mid-frame
+#   watchfail the readiness watch cannot be registered (descriptor -1)
+#   readfail  the terminal descriptor cannot be read (a write-only descriptor)
+#   writefail the terminal cannot be written (a read-only descriptor)
+#
+# Options: --in FD --out FD (the Terminal's descriptors, default 0 and 1),
+# --watch FD (the descriptor watched instead of the input), --linger MS.
+
+import event_loop_linux
+import monitor
+import std::event_loop
+import evlinger
+import std::int
+import std::io
+import std::linux::io
+import std::list
+import std::str
+import tui::app
+import tui::session
+import tui_event_loop_linux
+import type std::event_loop::Posted
+
+fn number(args: List[str], name: str, default: int) -> int:
+    fold i from 0 to args.length() - 1 with intermediate found default:
+        if args.get(i, "") == name:
+            std::int::from_string(args.get(i + 1, "")):
+                on InvalidIntegerText:
+                    found
+        else:
+            found
+
+fn word(args: List[str], name: str) -> str:
+    fold i from 0 to args.length() - 1 with intermediate found "":
+        if args.get(i, "") == name:
+            args.get(i + 1, "")
+        else:
+            found
+
+fn say(text: str, context io: std::linux::io::LinuxIO):
+    std::io::print_line(text):
+        on std::io::WriteFailed:
+            unit
+
+fn yes(flag: bool) -> str:
+    if flag:
+        return "yes"
+    "no"
+
+fn text(n: int) -> str:
+    std::int::to_string(n)
+
+# Try to take the terminal a second time: what happened, in a word.
+fn second_open(context ev: std::event_loop::Loop, n: event_loop_linux::Native, t: tui::session::Terminal, u: tui_event_loop_linux::Ui) -> str errors std::event_loop::SchedulerFault:
+    opened = tui_event_loop_linux::open():
+        on tui::session::NotATerminal {stream}:
+            return "notatty"
+        on tui::session::IoFailed {operation}:
+            return "iofailed"
+        on tui::session::TerminalBusy {reason}:
+            return "busy"
+        on std::event_loop::DriverFault {code}:
+            return "driver"
+    "opened"
+
+fn standalone_open(context t: tui::session::Terminal) -> str:
+    session = tui::session::open():
+        on tui::session::NotATerminal {stream}:
+            return "notatty"
+        on tui::session::IoFailed {operation}:
+            return operation
+    "opened"
+
+fn closer(inbox: tui_event_loop_linux::Inbox, delay: int, context ev: std::event_loop::Loop, u: tui_event_loop_linux::Ui) -> int errors std::event_loop::SchedulerFault:
+    std::event_loop::sleep(delay)
+    inbox.request_close()
+    0
+
+fn stopper(delay: int, context ev: std::event_loop::Loop) -> int errors std::event_loop::SchedulerFault:
+    std::event_loop::sleep(delay)
+    std::event_loop::stop()
+    0
+
+# Posts events as fast as the inbox takes them, a batch per turn.
+fn flooder(inbox: tui_event_loop_linux::Inbox, n: int, context ev: std::event_loop::Loop, u: tui_event_loop_linux::Ui) -> int errors std::event_loop::SchedulerFault:
+    if n > 400000:
+        return n
+    sent = inbox.notify(monitor::code_chunk, n)
+    if sent == Posted::NotLive:
+        return n
+    if sent == Posted::Accepted:
+        return inbox.flooder(n + 1)
+    std::event_loop::yield_now()
+    inbox.flooder(n)
+
+fn open_one(watched: int, context ev: std::event_loop::Loop, n: event_loop_linux::Native, t: tui::session::Terminal, u: tui_event_loop_linux::Ui) -> tui_event_loop_linux::Inbox errors tui::session::NotATerminal, tui::session::IoFailed, tui::session::TerminalBusy, std::event_loop::DriverFault, std::event_loop::SchedulerFault:
+    if watched < 0:
+        return tui_event_loop_linux::start(monitor::initial(10))
+    opened = tui_event_loop_linux::open_watching(watched)
+    {attached, ports} = opened
+    size = tui::session::size()
+    coroutine {step, first} = tui_event_loop_linux::serve(monitor::initial(10), attached, ports, size.width, size.height)
+    std::event_loop::adopt(step, first)
+    ports.inbox
+
+fn run_case(name: str, args: List[str], context ev: std::event_loop::Loop, d: event_loop_linux::Linux, n: event_loop_linux::Native, t: tui::session::Terminal, u: tui_event_loop_linux::Ui, io: std::linux::io::LinuxIO, s: evlinger::Sleeper) -> int errors std::event_loop::SchedulerFault, std::event_loop::DriverFault, std::event_loop::LoopReentered:
+    std::event_loop::sync()
+    watched = number(args, "--watch", -1)
+    started = open_one(watched):
+        on tui::session::NotATerminal {stream}:
+            say("CASE ".concat(name).concat(" open=notatty stream=").concat(stream).concat(" owned=").concat(yes(tui::session::owned?())))
+            return 0
+        on tui::session::IoFailed {operation}:
+            say("CASE ".concat(name).concat(" open=iofailed operation=").concat(operation).concat(" owned=").concat(yes(tui::session::owned?())))
+            return 0
+        on tui::session::TerminalBusy {reason}:
+            say("CASE ".concat(name).concat(" open=busy"))
+            return 0
+        on std::event_loop::DriverFault {code}:
+            say("CASE ".concat(name).concat(" open=driver code=").concat(text(code)).concat(" owned=").concat(yes(tui::session::owned?())))
+            return 0
+    inbox = started
+    if name == "busy":
+        second = second_open()
+        standalone = standalone_open()
+        coroutine {step, first} = closer(inbox, 100000)
+        std::event_loop::adopt(step, first)
+        std::event_loop::run()
+        first_end = inbox.outcome()
+        owned_after = tui::session::owned?()
+        again = second_open()
+        rounds = fold i from 0 to 3 with intermediate good 0:
+            round = open_one(-1):
+                on tui::session::NotATerminal {stream}:
+                    return -1
+                on tui::session::IoFailed {operation}:
+                    return -1
+                on tui::session::TerminalBusy {reason}:
+                    return -1
+                on std::event_loop::DriverFault {code}:
+                    return -1
+            coroutine {step: later, first: later_first} = closer(round, 30000)
+            std::event_loop::adopt(later, later_first)
+            std::event_loop::run()
+            good + 1 - 1 + 1
+        say("CASE busy second=".concat(second).concat(" standalone=").concat(standalone).concat(" first_outcome=").concat(text(first_end.code)).concat(" owned_after=").concat(yes(owned_after)).concat(" rounds=").concat(text(rounds)).concat(" owned_end=").concat(yes(tui::session::owned?())))
+        return 0
+    if name == "abandon":
+        before = inbox.running?()
+        gone = std::event_loop::abandon()
+        say("CASE abandon abandoned=".concat(text(gone)).concat(" running_before=").concat(yes(before)).concat(" owned_after=").concat(yes(tui::session::owned?())))
+        evlinger::linger(number(args, "--linger", 800))
+        return 0
+    if name == "shutdown":
+        coroutine {step, first} = stopper(200000)
+        std::event_loop::adopt(step, first)
+        std::event_loop::run()
+        gone = std::event_loop::shutdown(4)
+        done = inbox.outcome()
+        say("CASE shutdown abandoned=".concat(text(gone)).concat(" outcome=").concat(text(done.code)).concat(" running=").concat(yes(inbox.running?())).concat(" owned_after=").concat(yes(tui::session::owned?())))
+        evlinger::linger(number(args, "--linger", 800))
+        return 0
+    if name == "stale":
+        coroutine {step, first} = closer(inbox, 100000)
+        std::event_loop::adopt(step, first)
+        std::event_loop::run()
+        done = inbox.outcome()
+        sent = inbox.notify(1, 1)
+        redraw = inbox.request_redraw()
+        repaint = inbox.request_repaint()
+        close = inbox.request_close()
+        again = inbox.outcome()
+        say("CASE stale outcome=".concat(text(done.code)).concat(" send=").concat(yes(sent == Posted::NotLive)).concat(" redraw=").concat(yes(redraw == Posted::NotLive)).concat(" repaint=").concat(yes(repaint == Posted::NotLive)).concat(" close=").concat(yes(close == Posted::NotLive)).concat(" outcome_stable=").concat(yes(again.code == done.code)).concat(" running=").concat(yes(inbox.running?())).concat(" owned_after=").concat(yes(tui::session::owned?())))
+        return 0
+    if name == "flood":
+        coroutine {step, first} = flooder(inbox, 0)
+        std::event_loop::adopt(step, first)
+        coroutine {step: halt, first: halt_first} = stopper(number(args, "--stop", 2500000))
+        std::event_loop::adopt(halt, halt_first)
+        std::event_loop::run()
+        stats = inbox.stats()
+        gone = std::event_loop::abandon()
+        say("CASE flood abandoned=".concat(text(gone)).concat(" blocks=").concat(text(stats.write_blocks)).concat(" frames=").concat(text(stats.frames)).concat(" delivered=").concat(text(stats.delivered)).concat(" owned_after=").concat(yes(tui::session::owned?())))
+        evlinger::linger(number(args, "--linger", 800))
+        return 0
+    std::event_loop::run()
+    say("CASE ".concat(name).concat(" outcome=").concat(text(inbox.outcome().code)).concat(" detail=").concat(inbox.outcome().detail).concat(" owned_after=").concat(yes(tui::session::owned?())))
+    evlinger::linger(number(args, "--linger", 800))
+    0
+
+fn main(args: List[str], context ev: std::event_loop::Loop, d: event_loop_linux::Linux, n: event_loop_linux::Native, t: tui::session::Terminal, u: tui_event_loop_linux::Ui, io: std::linux::io::LinuxIO, s: evlinger::Sleeper) -> int errors std::event_loop::SchedulerFault, std::event_loop::DriverFault, std::event_loop::LoopReentered:
+    run_case(word(args, "--case"), args)
+
+args = argv():
+    on InvalidArgumentEncoding:
+        []
+with context std::event_loop::create(256)
+with context event_loop_linux::create()
+with context event_loop_linux::native()
+with context tui::session::create_on(number(args, "--in", 0), number(args, "--out", 1))
+with context tui_event_loop_linux::create()
+with context std::linux::io::create()
+with context evlinger::create()
+main(args):
+    on std::event_loop::SchedulerFault:
+        -2
+    on std::event_loop::DriverFault {code}:
+        -3
+    on std::event_loop::LoopReentered:
+        -4

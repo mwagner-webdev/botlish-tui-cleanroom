@@ -1,0 +1,178 @@
+{
+  "provenance": 1,
+  "subject": {
+    "name": "event_loop_linux",
+    "version": "0.5.0",
+    "artifact": "event_loop_linux-0.5.0.botpkg",
+    "sha256": "ecd9e8114fa5bc24c2d23a2068e96ec2932e9386ca0cdb79fc568b9662146f77",
+    "size": 40216,
+    "format": 1,
+    "schema": 2,
+    "targets": [
+      "linux-aarch64",
+      "linux-x86_64"
+    ]
+  },
+  "producer": {
+    "tool": "botlish package manager",
+    "sources-sha256": "7a916173762e73fc70c6261a7246b1f59278ea3d5161cc74b3b5ce35fadb1061"
+  },
+  "contents": [
+    {
+      "path": "README.md",
+      "size": 1912,
+      "sha256": "8fc70a105bb3e1bc1e53a96798881f1b7777b4ebef8c9451e209a393e0b904a4"
+    },
+    {
+      "path": "botlish.json",
+      "size": 737,
+      "sha256": "9b90669a0ec15960955cca90f8e290177b62c81a37aea1cf85992fb383edaa19"
+    },
+    {
+      "path": "event_loop_linux.bot",
+      "size": 12613,
+      "sha256": "14801beef20ea09abd426aa6fe40326161877bedda037ce9e6437bed09bc1def"
+    },
+    {
+      "path": "native/event_loop_linux.c",
+      "size": 33242,
+      "sha256": "934e33659caf9f3e899441fa4317bd086c7c2ae5dde6035927a8116dc577b9fd"
+    },
+    {
+      "path": "targets/linux-aarch64/include/botlish_event_loop.h",
+      "size": 5942,
+      "sha256": "1dd0248c46a694f07a62ef7fdcf01ca08519eb063e77df82b77923c5235e5479"
+    },
+    {
+      "path": "targets/linux-aarch64/native/libevent_loop_linux.a",
+      "size": 28004,
+      "sha256": "da69c74d8627871c60482bace1b33ca530c8a0044548884345c1cdce887c6f13"
+    },
+    {
+      "path": "targets/linux-x86_64/include/botlish_event_loop.h",
+      "size": 5942,
+      "sha256": "1dd0248c46a694f07a62ef7fdcf01ca08519eb063e77df82b77923c5235e5479"
+    },
+    {
+      "path": "targets/linux-x86_64/native/libevent_loop_linux.a",
+      "size": 21708,
+      "sha256": "23ddb58ab496758ded06e8f7fdd515c3401091b6d41748e832dc12de2a002125"
+    }
+  ],
+  "native": [
+    {
+      "target": "linux-aarch64",
+      "library": "event_loop_linux",
+      "linkage": "static",
+      "path": "targets/linux-aarch64/native/libevent_loop_linux.a",
+      "sha256": "da69c74d8627871c60482bace1b33ca530c8a0044548884345c1cdce887c6f13",
+      "description": "an ar archive of 1 ELF AArch64 object",
+      "members": [
+        {
+          "name": "event_loop_linux.o",
+          "size": 27248,
+          "sha256": "f9dd77ffeb6f99dda0394aafb67d828f627a0fead0feed30d7cf4d588332ff71"
+        }
+      ],
+      "compilers": [
+        "GCC: (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0"
+      ]
+    },
+    {
+      "target": "linux-x86_64",
+      "library": "event_loop_linux",
+      "linkage": "static",
+      "path": "targets/linux-x86_64/native/libevent_loop_linux.a",
+      "sha256": "23ddb58ab496758ded06e8f7fdd515c3401091b6d41748e832dc12de2a002125",
+      "description": "an ar archive of 1 ELF x86-64 object",
+      "members": [
+        {
+          "name": "event_loop_linux.o",
+          "size": 20952,
+          "sha256": "4eb82d94495c21b9d6a1d05ebf0a00aaf149bb75c5e4a0cbba9e820898fe56f8"
+        }
+      ],
+      "compilers": [
+        "GCC: (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0"
+      ]
+    }
+  ],
+  "sources": [],
+  "builds": [
+    {
+      "name": "event loop adapter linux-aarch64",
+      "targets": [
+        "linux-aarch64"
+      ],
+      "outputs": [
+        "targets/linux-aarch64/native/libevent_loop_linux.a"
+      ],
+      "sources": [],
+      "configuration": "adapter",
+      "toolchain": {
+        "ar": "GNU ar (GNU Binutils for Ubuntu) 2.42",
+        "cc": "aarch64-linux-gnu-gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0"
+      },
+      "flags": [
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-fPIC",
+        "-pthread"
+      ],
+      "image": "botlish-package-build: Dockerfile sha256 45f9c049946710ae6c392b62676a74cf519207e59437351071dc1eab18cbae0b, FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852, Ubuntu snapshot 20261101T000000Z",
+      "steps": [
+        "aarch64-linux-gnu-gcc -c native/event_loop_linux.c",
+        "aarch64-linux-gnu-ar rcs libevent_loop_linux.a event_loop_linux.o"
+      ]
+    },
+    {
+      "name": "event loop adapter linux-x86_64",
+      "targets": [
+        "linux-x86_64"
+      ],
+      "outputs": [
+        "targets/linux-x86_64/native/libevent_loop_linux.a"
+      ],
+      "sources": [],
+      "configuration": "adapter",
+      "toolchain": {
+        "ar": "GNU ar (GNU Binutils for Ubuntu) 2.42",
+        "cc": "cc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0"
+      },
+      "flags": [
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-fPIC",
+        "-pthread"
+      ],
+      "image": "botlish-package-build: Dockerfile sha256 45f9c049946710ae6c392b62676a74cf519207e59437351071dc1eab18cbae0b, FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852, Ubuntu snapshot 20261101T000000Z",
+      "steps": [
+        "cc -c native/event_loop_linux.c",
+        "ar rcs libevent_loop_linux.a event_loop_linux.o"
+      ]
+    }
+  ],
+  "generators": [],
+  "checks": [
+    {
+      "subject": "build event loop adapter linux-aarch64",
+      "fact": "output targets/linux-aarch64/native/libevent_loop_linux.a",
+      "value": "da69c74d8627871c60482bace1b33ca530c8a0044548884345c1cdce887c6f13",
+      "result": "confirmed",
+      "method": "the artifact holds 1 file the build names (the value: its SHA-256); that the build made them is the author's statement"
+    },
+    {
+      "subject": "build event loop adapter linux-x86_64",
+      "fact": "output targets/linux-x86_64/native/libevent_loop_linux.a",
+      "value": "23ddb58ab496758ded06e8f7fdd515c3401091b6d41748e832dc12de2a002125",
+      "result": "confirmed",
+      "method": "the artifact holds 1 file the build names (the value: its SHA-256); that the build made them is the author's statement"
+    }
+  ],
+  "notes": [],
+  "trust": "This record was made by whoever packed the artifact. Its computed facts were computed from the artifact's bytes when it was made; its assertions are the author's own statements, checked only where its checks say so. It is not a signature: it does not authenticate who made the artifact, and it does not show that the sources or the build environment can be trusted."
+}

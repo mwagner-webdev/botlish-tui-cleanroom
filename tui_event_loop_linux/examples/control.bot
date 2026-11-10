@@ -1,0 +1,120 @@
+# control -- state shared by the demonstration's tasks.
+#
+# A collection is a value in Botlish; storage that several tasks of one loop
+# share is a context.  The controller task writes the stream's state, the
+# stream task reads it, and the ticker records how late its timer fired.
+
+import std::int
+import std::mutable_array
+import std::str
+
+# cells: 0 state, 1 chunks sent, 2 total, 3 interval (microseconds), 4 mark,
+# 5..12 lateness histogram, 13 max lateness, 14 count, 15 sum, 16 stamping,
+# 17 chunks posted per interval.
+opaque context struct Control:
+    cells: MutableArray[int]
+
+nomethod fn create(total: int, interval: int, stamp: bool, batch: int) -> Control:
+    flag = if stamp:
+        1
+    else:
+        0
+    Control {cells: std::mutable_array::from_list([0, 0, total, interval, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, flag, batch])}
+
+private fn read(index: int, context c: Control) -> int:
+    c.cells.at(index):
+        on IndexNotFound:
+            0
+
+private nomethod fn write(index: int, value: int, context c: Control):
+    c.cells.set(index, value):
+        on IndexNotFound:
+            return unit
+    unit
+
+fn state(context c: Control) -> int:
+    read(0)
+
+nomethod fn set_state(value: int, context c: Control):
+    write(0, value)
+
+fn sent(context c: Control) -> int:
+    read(1)
+
+nomethod fn record_sent(value: int, context c: Control):
+    write(1, value)
+
+fn total(context c: Control) -> int:
+    read(2)
+
+fn interval(context c: Control) -> int:
+    read(3)
+
+# True when the stream also posts a timestamp after each chunk.
+fn stamping?(context c: Control) -> bool:
+    read(16) != 0
+
+# Chunks the stream posts per interval (at least 1).
+fn batch(context c: Control) -> int:
+    if read(17) < 1:
+        return 1
+    read(17)
+
+fn mark(context c: Control) -> int:
+    read(4)
+
+nomethod fn set_mark(value: int, context c: Control):
+    write(4, value)
+
+# The integer quotient of A by B (> 0), by repeated halving.
+private nomethod fn quotient_from(a: int, b: int, bit: int, acc: int) -> int:
+    if bit < 0:
+        return acc
+    scaled = b.shift_left(bit)
+    if a >= scaled:
+        return quotient_from(a - scaled, b, bit - 1, acc + shift_left(1, bit))
+    quotient_from(a, b, bit - 1, acc)
+
+private nomethod fn quotient(a: int, b: int) -> int:
+    if a <= 0 or b <= 0 or a < b:
+        return 0
+    quotient_from(a, b, 40, 0)
+
+private fn bucket(late: int) -> int:
+    if late < 500:
+        return 5
+    if late < 1000:
+        return 6
+    if late < 2000:
+        return 7
+    if late < 5000:
+        return 8
+    if late < 10000:
+        return 9
+    if late < 20000:
+        return 10
+    if late < 50000:
+        return 11
+    12
+
+# One timer wake-up that came LATE microseconds after its deadline.
+nomethod fn record_late(late: int, context c: Control):
+    clamped = if late < 0:
+        0
+    else:
+        late
+    index = bucket(clamped)
+    write(index, read(index) + 1)
+    write(14, read(14) + 1)
+    write(15, read(15) + clamped)
+    if clamped > read(13):
+        write(13, clamped)
+
+# "n=.. mean_us=.. max_us=.. <0.5ms=.. <1=.. <2=.. <5=.. <10=.. <20=.. <50=.. >=50=..".
+fn late_report(context c: Control) -> str:
+    count = read(14)
+    mean = if count > 0:
+        quotient(read(15), count)
+    else:
+        0
+    "n=".concat(std::int::to_string(count)).concat(" mean_us=").concat(std::int::to_string(mean)).concat(" max_us=").concat(std::int::to_string(read(13))).concat(" b0=").concat(std::int::to_string(read(5))).concat(" b1=").concat(std::int::to_string(read(6))).concat(" b2=").concat(std::int::to_string(read(7))).concat(" b5=").concat(std::int::to_string(read(8))).concat(" b10=").concat(std::int::to_string(read(9))).concat(" b20=").concat(std::int::to_string(read(10))).concat(" b50=").concat(std::int::to_string(read(11))).concat(" bmore=").concat(std::int::to_string(read(12)))

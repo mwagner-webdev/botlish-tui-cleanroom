@@ -351,6 +351,40 @@ Guarantees: state is restored after normal exit and after any error that propaga
 out of `run`; **not** after `SIGKILL`/`SIGTERM` (there are no signal handlers in the
 language). Interpreter and `compile` backends refuse the syscalls (`NATIVE-ONLY`).
 
+### 10.1 The same session without a loop of its own (0.2.0)
+
+`run` is built from public pieces, so a program that already has an event loop
+can drive the terminal itself. Nothing in `tui` waits, schedules or knows about
+an event loop; the integration package `tui_event_loop_linux` (a separate
+package with its own README) is one such program. The pieces:
+
+```botlish
+session = tui::session::open_driven()      # raw mode + nonblocking input descriptor, claimed
+read = tui::session::read_bytes()          # one read(2): Data / Idle / Closed / Hangup, never waits
+host = host.feed(read.bytes)               # tui::host: decode; Fed {host, events}
+next = tui::app::apply_events(app, fed.events, 0)
+frame = host.frame(app)                    # the bytes that bring the screen up to date
+at = tui::session::write_some(tui::session::encode(frame.text), offset, 16384)   # one write step
+```
+
+* `open_driven` fails `TerminalBusy` if this `Terminal` already has a Session. The
+  Session's cleanup restores the termios, the screen **and the input descriptor's
+  original flags**, and gives up the ownership; a driven session's screen restore is
+  written with a patience of about one second, so a stuck terminal cannot hang the
+  cleanup.
+* `read_bytes` distinguishes the *absence* of bytes (`Idle`) from the end of input
+  (`Closed`) and a hung-up terminal (`Hangup`, EIO).
+* `write_some` returns the new offset; an unchanged offset means the terminal cannot
+  take output now (wait until it is writable, then call again). A frame that is not
+  written in full must be reported with `tui::host::frame_failed(host)`: the next
+  frame then repaints every cell.
+* `tui::host` holds no application (an `Application` is a trait view, which a struct
+  field cannot hold): the caller applies `Fed.events` with `apply_events`. The
+  decoder, the escape-timeout rule (`silence` after `escape_timeout_ms`), the dirty
+  flag and the renderer's memory are the ones `run` uses.
+* An event that is not from the keyboard is a `Custom` event: `tui::input::custom(code,
+  value)`; `update` sees it like a key. `pack`/`unpack` turn an event into two ints.
+
 ## 11. Testing without a terminal
 
 Because the state machine, the view and the decoder are pure, tests are ordinary
@@ -387,7 +421,8 @@ that incremental updates and full redraws show the same screen.
 |---|---|---|
 | `tui::canvas::OutOfBounds` | `cell_at` | reading outside the screen |
 | `tui::session::NotATerminal {stream}` | `run`, `size` | `stream` is `"input"`, `"output"` or `"size"` |
-| `tui::session::IoFailed {operation}` | `run`, `write_text` | `configure`, `read`, `poll`, `write`, ... failed |
+| `tui::session::IoFailed {operation}` | `run`, `write_text`, `read_bytes`, `write_some` | `configure`, `nonblocking`, `read`, `poll`, `write`, `busy`, ... failed |
+| `tui::session::TerminalBusy {reason}` | `open_driven` | another Session owns this Terminal (the 0.1.0 functions report `IoFailed "busy"`) |
 | `tui::app::Abort {reason}` | your `update` | application failure; the terminal is restored first |
 
 Everything else is total: drawing is clipped, malformed input becomes `Unknown`/`U+FFFD`

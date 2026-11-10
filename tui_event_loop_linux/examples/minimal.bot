@@ -1,0 +1,81 @@
+# minimal -- the smallest program that puts the terminal in its own event loop:
+# the starting point for an application with several asynchronous activities.
+#
+#   botlish -emit-native-executable minimal.bot && ./minimal     (q quits)
+#
+# The application is an ordinary tui application (update / view / finished?).
+# Anything that happens elsewhere reaches it as a Custom event: the `worker`
+# task below stands for whatever produces events in a real program (a streaming
+# HTTP response, a managed subprocess, a timer) and posts them with notify.
+
+import event_loop_linux
+import std::event_loop
+import std::int
+import std::str
+import tui::app
+import tui::canvas
+import tui::input
+import tui::session
+import tui::style
+import tui_event_loop_linux
+import type std::event_loop::Posted
+
+code_progress = 1
+
+struct Counter:
+    progress: int
+    keys: int
+    quit: bool
+
+fn update(app: Counter, event: tui::input::Event) -> Counter:
+    if event.is_char?(113):
+        return Counter {progress: app.progress, keys: app.keys, quit: true}
+    if event.kind == tui::input::Kind::Custom and event.ch == code_progress:
+        return Counter {progress: event.width, keys: app.keys, quit: app.quit}
+    if event.kind == tui::input::Kind::Char:
+        return Counter {progress: app.progress, keys: app.keys + 1, quit: app.quit}
+    app
+
+fn view(app: Counter, width: int, height: int) -> tui::canvas::Canvas:
+    line = "progress ".concat(std::int::to_string(app.progress)).concat("   keys ").concat(std::int::to_string(app.keys)).concat("   (q quits)")
+    tui::canvas::new(width, height).text(0, 0, line, tui::style::plain())
+
+fn finished?(app: Counter) -> bool:
+    app.quit
+
+# A producer: one event every 200 ms.  A post that says NotLive means the UI
+# task has ended, so the producer ends too.
+fn worker(inbox: tui_event_loop_linux::Inbox, n: int, context ev: std::event_loop::Loop, ui: tui_event_loop_linux::Ui) -> int errors std::event_loop::SchedulerFault:
+    std::event_loop::sleep(200000)
+    if inbox.notify(code_progress, n + 1) == Posted::NotLive:
+        return n
+    inbox.worker(n + 1)
+
+fn main(context ev: std::event_loop::Loop, d: event_loop_linux::Linux, n: event_loop_linux::Native, term: tui::session::Terminal, ui: tui_event_loop_linux::Ui) -> int errors std::event_loop::SchedulerFault, std::event_loop::DriverFault, std::event_loop::LoopReentered:
+    std::event_loop::sync()
+    inbox = tui_event_loop_linux::start(Counter {progress: 0, keys: 0, quit: false}):
+        on tui::session::NotATerminal {stream}:
+            return 2
+        on tui::session::IoFailed {operation}:
+            return 2
+        on tui::session::TerminalBusy {reason}:
+            return 2
+        on std::event_loop::DriverFault {code}:
+            return 2
+    coroutine {step, first} = worker(inbox, 0)
+    std::event_loop::adopt(step, first)
+    std::event_loop::run()
+    inbox.outcome().code
+
+with context std::event_loop::create(64)
+with context event_loop_linux::create()
+with context event_loop_linux::native()
+with context tui::session::create()
+with context tui_event_loop_linux::create()
+main():
+    on std::event_loop::SchedulerFault:
+        -2
+    on std::event_loop::DriverFault {code}:
+        -3
+    on std::event_loop::LoopReentered:
+        -4

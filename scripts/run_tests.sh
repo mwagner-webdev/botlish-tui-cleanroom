@@ -9,7 +9,7 @@ BOT=${BOT:-$(cd "$(dirname "$0")/.." && pwd)/botlish-linux-x86_64}
 STATUS=0
 cd "$1" || exit 2
 shift
-FILES=${@:-"test_canvas.bot test_ansi.bot test_input.bot test_layout.bot test_widgets.bot test.bot"}
+FILES=${@:-"test_canvas.bot test_ansi.bot test_input.bot test_layout.bot test_widgets.bot test_host.bot test.bot"}
 for f in $FILES; do
   for b in interp compile cranelift cranelift-generic; do
     start=$(date +%s.%N)

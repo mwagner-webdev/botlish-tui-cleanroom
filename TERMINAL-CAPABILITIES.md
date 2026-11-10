@@ -55,3 +55,16 @@ function exists); **D** = documented but not verified; **U** = apparently unavai
 * `sigterm.py`: terminal state after `SIGTERM`/`SIGINT`/`SIGKILL` (never restored).
 * `menu_pty.py`: PTY run of the consumer's own application.
 * The full acceptance run is `tui/tests/pty_acceptance.py` (26 checks).
+
+## Addendum (TUI-EVENT-LOOP-INTEGRATION-MILESTONE-1): capabilities for an externally driven session
+
+Verified in a pty with `strace` and `/proc/PID/fdinfo` (see `TUI-EVENT-LOOP-INTEGRATION-MILESTONE-1.md`).
+
+| # | capability | status | evidence / limit |
+|---|---|---|---|
+| 11 | Nonblocking terminal input (`fcntl F_SETFL O_NONBLOCK`) through the same raw-syscall transport | **V\*** | `read` then returns `EAGAIN` for "no bytes now", 0 for end of file; the original flags are written back on release (checked from the kernel's `fdinfo`). **Caveat:** stdin and stdout share one open file description on a normal terminal, so stdout becomes nonblocking too: writes can return `EAGAIN` (observed under an undrained terminal) and need a writable wait. |
+| 12 | Readiness of a terminal descriptor in the application's `std::event_loop` | **V** | The published `event_loop_linux` driver watches fd 0 (readable) and fd 1 (writable, armed only when a write was refused) with epoll; one-shot, re-armed after reading to `EAGAIN`; `EPOLLHUP` reported when the pty master closes. |
+| 13 | Distinguishing hangup from "no data" | **V** | A closed pty master reads as 0 (end of file) and makes writes fail with `EIO`; `EIO` on `read` (tty hangup/revoke) is reachable only by injection and is treated as input ended. |
+| 14 | Window size on the loop's timer | **V\*** | `TIOCGWINSZ` sampled every 100 ms by a task; zero size reads as 80x24; a failing ioctl keeps the last size. No `SIGWINCH` (unchanged limit). |
+| 15 | Fault injection into the transport | **V** | `strace -f -e inject=SYSCALL:error=E:when=N` with `-P /dev/pts/N`; `when` counts per thread, so call numbers are calibrated from a clean trace per thread. |
+| — | Exclusive terminal ownership | **V\*** | Per `Terminal` context (per VM); another VM's own context is not stopped. |

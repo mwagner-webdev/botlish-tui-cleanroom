@@ -1,0 +1,45 @@
+# tui::display -- what the terminal currently shows, and the bytes that change
+# it into the next frame.  Portable and pure: nothing here writes anything.
+#
+# A Display is the renderer's memory between frames: the screen the terminal
+# is believed to show.  `plan` diffs the next screen against it (tui::ansi::diff,
+# incremental; a different size or an unknown terminal gives a full redraw) and
+# returns the bytes together with the Display that results once they have been
+# written IN FULL.  The caller owns the writing, so it also owns the one rule
+# that keeps the memory honest:
+#
+#     whole frame written      ->  keep Frame.display
+#     anything else            ->  use invalidate(old display): the terminal
+#                                  shows an unknown mixture, so the next plan
+#                                  repaints every cell
+#
+# (a frame that was only partly written, a write that failed, a session that
+# was interrupted while writing).  tui::session::run and an event-loop host
+# use exactly these functions, so the two modes render identically.
+
+import tui::canvas
+import tui::ansi
+
+struct Display:
+    shown: tui::canvas::Screen
+
+struct Frame:
+    display: Display
+    text: str
+
+# Nothing is known to be on the terminal: the first plan is a full redraw.
+fn new() -> Display:
+    Display {shown: tui::canvas::blank(0, 0)}
+
+# True when the terminal's contents are unknown (new or invalidated).
+fn unknown?(display: Display) -> bool:
+    display.shown.width == 0 and display.shown.height == 0
+
+# Forget what the terminal shows: the next plan repaints everything.
+fn invalidate(display: Display) -> Display:
+    new()
+
+# The bytes (as text) that turn the terminal into SCREEN.  Empty when nothing
+# changed.
+fn plan(display: Display, screen: tui::canvas::Screen) -> Frame:
+    Frame {display: Display {shown: screen}, text: display.shown.diff(screen)}

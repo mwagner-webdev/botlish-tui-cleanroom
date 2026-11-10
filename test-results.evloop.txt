@@ -1,0 +1,136 @@
+# pty_evloop.py ./evdemo — from the installed artifacts, consumer-evloop (compiler: source revision: 0a518ba, packaged)
+-- scenario_startup_timers_idle
+PASS startup: cooked mode before the first frame is not our concern (the PTY starts cooked)
+PASS startup: the first frame is drawn (status bar)
+PASS startup: alternate screen entered, cursor hidden
+PASS startup: raw mode while running (no echo, no canon, no isig)
+PASS startup: the input descriptor is nonblocking while running (kernel flags)
+PASS idle: 2 s with a timer and no input cost < 0.1 s CPU (no busy loop)
+PASS timers: the tick counter advances with no keyboard input (0 -> 8 in 2 s)
+-- scenario_keys
+PASS keys: one byte is one key event
+PASS keys: three keys in one read arrive as three events, in order
+PASS keys: an escape sequence split across three reads decodes as one key (left)
+PASS keys: a lone Escape is resolved by the loop timer (50 ms), not lost
+PASS keys: a multi-byte UTF-8 character arrives whole
+PASS keys: a burst of 30 bytes in a few writes loses none (keys counter)
+PASS redraw: the r key (a task asks the UI task for a repaint) repaints everything
+PASS redraw: a second repaint request is honoured too (the coalescing flag is released)
+PASS redraw: request_redraw of an unchanged view writes nothing visible and costs no crash
+-- scenario_resize
+PASS resize: a size change while idle is delivered to the application (log line) within 3 s
+PASS resize: the frame fills the new size (status bar on row 30)
+PASS resize: back to the original size is delivered too
+PASS resize: a zero-sized terminal reads as 80x24 (no event, no crash)
+PASS resize: and a real size after it is delivered again
+-- scenario_stream_control
+PASS stream: s starts the stream (state change event from another task)
+PASS stream: external events redraw the screen with no keyboard input (chunks >= 5)
+PASS stream: p pauses
+PASS stream: no chunks while paused (9 -> 9)
+PASS stream: p resumes, chunks advance again
+PASS stream: c cancels
+PASS stream: no chunks after cancel
+PASS stream: s restarts a cancelled stream
+PASS stream: q ends the program by itself while the stream is live (producers see NotLive)
+PASS stream: report printed after the terminal was restored; outcome 0
+-- scenario_no_loss
+PASS stream: 2000 chunks at 2 kHz complete
+PASS stream: the last frame shows every chunk (2000/2000)
+PASS no loss: every accepted event reached the application (posted == delivered)
+PASS no loss: the stream sent 2000 and the report counted them
+INFO 2 kHz stream: 2005 frames for 4009 events (one frame per event while the UI keeps up)
+-- scenario_quit_restore_linger
+PASS quit: the program is still alive (lingering) so the terminal can be inspected
+PASS restore: echo, canon, isig back after the UI task ended (loop still running)
+PASS restore: descriptor flags back (O_NONBLOCK cleared) after the UI task ended
+PASS restore: alternate screen left, cursor shown
+PASS restore: the program exits by itself after the linger
+PASS report: printed on the restored main screen, outcome 0
+PASS watch revoked: typing at the terminal after the UI ended produced no readiness record
+-- scenario_error_path
+PASS error: an application failure ends the UI task, the program ends by itself
+PASS error: outcome 2 with the application own reason
+PASS error: terminal restored (echo, canon, isig)
+-- scenario_ctrl_c
+PASS Ctrl+C arrives as a key (ISIG off) and quits cleanly
+-- scenario_hangup
+PASS hangup: closing the terminal of an idle program ends it by itself (readiness HUP, no busy loop)
+PASS hangup: closing the terminal of a program that is writing ends it too
+-- scenario_not_a_tty
+PASS no terminal: NotATerminal is reported, nothing drawn, no raw mode
+-- scenario_sigkill_documented
+PASS SIGKILL: restoration is NOT possible (documented): the terminal stays raw
+-- scenario_flood_keys_resize_timers
+INFO key->screen latency during a 3 kHz stream: p50 2.7 ms, p95 3.1 ms, max 4.6 ms
+PASS flood: all 20 keys during a sustained stream reach the application, each within 1 s
+PASS resize during the stream: the frame fills the new size (status bar on row 30)
+PASS resize back to the original size (status bar on row 24)
+PASS timers: the 50 ms timer keeps its pace during the flood (34 ticks, 36 expected)
+PASS flood: ends cleanly
+INFO ticker lateness: {'n': '80', 'mean_us': '461', 'max_us': '6950', 'b0': '49', 'b1': '26', 'b2': '4', 'b5': '0', 'b10': '1', 'b20': '0', 'b50': '0', 'bmore': '0'}
+PASS flood: the ticker task slept 50 ms 80 times; none later than 100 ms
+-- scenario_blocked_output
+INFO blocked-output: tick 0 -> 122 over 12.2 s (100 ms timer)
+PASS blocked output: timers kept running while the terminal did not drain (ticks follow wall time)
+PASS blocked output: keys typed while output was blocked were processed
+PASS blocked output: ends cleanly afterwards
+INFO blocked-output ticker lateness: {'n': '125', 'mean_us': '306', 'max_us': '4318', 'b0': '96', 'b1': '24', 'b2': '4', 'b5': '1', 'b10': '0', 'b20': '0', 'b50': '0', 'bmore': '0'}
+PASS blocked output: timers kept running (the ticker task never woke more than 500 ms late)
+INFO blocked-output report: write_blocks=2 frames=12583
+PASS blocked output: the blocked-write path was really exercised (write_blocks > 0)
+-- scenario_quit_while_blocked
+PASS cancel while a redraw is blocked: the terminal is restored within the bounded patience (0.6 s)
+PASS cancel while a redraw is blocked: the program ends
+
+63 checks, 63 passed, 0 failed
+
+# pty_faults.py ./evcases ./evdemo
+-- part_cases
+PASS busy: the program finishes by itself
+PASS busy: a second owner is refused (TerminalBusy) while the first is running
+PASS busy: the standalone open is refused too, as IoFailed "busy"
+PASS busy: the first session ended normally (close requested, code 4) and the terminal is free again
+PASS busy: three more open/close rounds succeed; nothing owns the terminal at the end
+PASS busy: terminal restored after repeated initialisation and shutdown
+PASS abandon: the abandoned UI task released the terminal (loop abandon)
+PASS abandon: raw mode undone by the abandoned coroutine's cleanup
+PASS abandon: descriptor flags restored (O_NONBLOCK cleared)
+PASS abandon: screen restore written (alternate screen left)
+PASS shutdown: shutdown() revoked the inbox; the UI task ended itself with code 5
+PASS shutdown: terminal and descriptor restored
+PASS stale: after the UI ended, send / redraw / repaint / close all say NotLive; the outcome is stable
+PASS stale: nothing owns the terminal afterwards
+PASS watch registration failure: DriverFault (EBADF) is reported, nothing is left owned
+PASS watch registration failure: raw mode and flags undone, screen left
+PASS terminal read failure: the UI task ends with outcome 3 "read"
+PASS terminal read failure: terminal restored
+PASS terminal write failure: open fails with IoFailed "write"; nothing left owned
+PASS terminal write failure: terminal restored
+PASS terminal descriptor unavailable (input): NotATerminal naming "input"; nothing owned
+PASS terminal descriptor unavailable (output): NotATerminal naming "output"; raw mode never entered
+PASS stdin not a terminal: NotATerminal "input", nothing drawn
+PASS cancel during a blocked redraw: termios restored although the screen restore could not be written (bounded patience)
+PASS cancel during a blocked redraw: the flood really blocked output (write_blocks > 0) and the UI task was abandoned
+PASS cancel during a blocked redraw: the program ends
+-- part_injection
+INFO calibration (call numbers within their syscall): {'tcsets': 3, 'setfl': 2, 'add_in': 2, 'add_out': 3, 'mod_in': 4, 'read_in': 1, 'frame2': 3, 'winsz': 2}
+PASS calibration: every call the injections need was found in the clean trace
+PASS raw-mode failure (TCSETS refused): reported as IoFailed "configure"
+PASS raw-mode failure: no screen change was made and the terminal is as it was
+PASS nonblocking refused (F_SETFL fails): reported as IoFailed "nonblocking"
+PASS nonblocking refused: raw mode undone, screen left, nothing owned
+PASS readiness registration of the input refused: DriverFault reported
+PASS readiness registration refused: terminal fully restored (raw mode, flags, screen)
+PASS readiness registration of the output refused: the input watch already made is withdrawn, terminal restored
+PASS terminal read failure (EBADF): the UI task ends, outcome 3 "read", program exits
+PASS terminal read failure: terminal restored
+PASS terminal hangup (EIO on read): the input has ended (outcome 1), no busy loop, program exits
+PASS readiness re-arm refused: the UI task ends with outcome 6 (driver), terminal restored
+PASS failed output (EIO on a frame): outcome 3 "write", program exits, terminal restored
+PASS interrupted output (three writes refused with EAGAIN): the screen is still correct and keeps updating
+PASS interrupted output: the blocked-write path was taken (write_blocks >= 1) and the session ended cleanly
+PASS size unavailable (TIOCGWINSZ fails from now on): no crash, no resize event, the application keeps running
+PASS size unavailable: ends cleanly
+
+43 checks, 43 passed, 0 failed

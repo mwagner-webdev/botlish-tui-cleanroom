@@ -1,0 +1,50 @@
+# consumer-evloop (installed artifacts), all backends that can run it
+test_monitor compile: 10 passed, 0 failed
+test_monitor cranelift: 10 passed, 0 failed
+test_monitor cranelift-generic: 10 passed, 0 failed
+# portable suites, dev/ (scripts/run_tests.sh, -warnings error)
+test_canvas.bot    interp             43 passed, 0 failed         7.0s
+test_canvas.bot    compile            43 passed, 0 failed         6.2s
+test_canvas.bot    cranelift          43 passed, 0 failed         8.4s
+test_canvas.bot    cranelift-generic  43 passed, 0 failed         6.7s
+test_ansi.bot      interp             21 passed, 0 failed        54.4s
+test_ansi.bot      compile            21 passed, 0 failed         7.8s
+test_ansi.bot      cranelift          21 passed, 0 failed         8.0s
+test_ansi.bot      cranelift-generic  21 passed, 0 failed         6.6s
+test_input.bot     interp             34 passed, 0 failed        82.8s
+test_input.bot     compile            34 passed, 0 failed        10.0s
+test_input.bot     cranelift          34 passed, 0 failed         9.9s
+test_input.bot     cranelift-generic  34 passed, 0 failed         8.5s
+test_layout.bot    interp             21 passed, 0 failed        13.5s
+test_layout.bot    compile            21 passed, 0 failed        10.2s
+test_layout.bot    cranelift          21 passed, 0 failed        12.6s
+test_layout.bot    cranelift-generic  21 passed, 0 failed         9.5s
+test_widgets.bot   interp             29 passed, 0 failed        10.8s
+test_widgets.bot   compile            29 passed, 0 failed         9.8s
+test_widgets.bot   cranelift          29 passed, 0 failed        15.5s
+test_widgets.bot   cranelift-generic  29 passed, 0 failed        11.9s
+test_host.bot      interp             19 passed, 0 failed        14.5s
+test_host.bot      compile            19 passed, 0 failed        13.9s
+test_host.bot      cranelift          19 passed, 0 failed        19.1s
+test_host.bot      cranelift-generic  19 passed, 0 failed        17.1s
+test.bot           interp             19 passed, 0 failed        21.4s
+test.bot           compile            19 passed, 0 failed        17.1s
+test.bot           cranelift          19 passed, 0 failed        27.4s
+test.bot           cranelift-generic  19 passed, 0 failed        18.6s
+test_session.bot   cranelift          4 passed, 0 failed
+test_session.bot   cranelift-generic  4 passed, 0 failed
+test_session.bot   interp             (expected NATIVE-ONLY) == test_session.bot (interp)    error: std::abi::x86_64::from_mutable_bytes produces the machine address of a writable byte buffer, which exists only in the native backend (cranelift, or a standalone executable) on Linux x86-64; the Tcl backends (interp, compile) have no machine addresses and do not
+# consumer/ (installed tui-0.2.0.botpkg): fast + generic backends
+test_widgets compile: 29 passed, 0 failed
+test_widgets cranelift: 29 passed, 0 failed
+test_widgets cranelift-generic: 29 passed, 0 failed
+test_host compile: 19 passed, 0 failed
+test_host cranelift: 19 passed, 0 failed
+test_host cranelift-generic: 19 passed, 0 failed
+test compile: 19 passed, 0 failed
+test cranelift: 19 passed, 0 failed
+test cranelift-generic: 19 passed, 0 failed
+menu_test compile: 3 passed, 0 failed
+menu_test cranelift: 3 passed, 0 failed
+menu_test cranelift-generic: 3 passed, 0 failed
+4 passed, 0 failed

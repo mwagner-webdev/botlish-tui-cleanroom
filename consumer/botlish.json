@@ -3,15 +3,15 @@
   "name": "consumer",
   "version": "0.1.0",
   "dependencies": {
-    "tui": "0.1"
+    "tui": "0.2"
   },
   "lock": {
-    "tui": "0.1.0"
+    "tui": "0.2.0"
   },
   "sources": {
     "tui": {
-      "archive": "../dist/tui-0.1.0.botpkg",
-      "sha256": "d442e0d42e18343de43c4cea2345202f0bcbc08267310a4c439a7173413d0ffa"
+      "archive": "../dist/tui-0.2.0.botpkg",
+      "sha256": "ddb64c66ff4459ef582b3e692d44c9b1012ce4eb5ac6ce4b761c14055b74e3d2"
     }
   }
 }

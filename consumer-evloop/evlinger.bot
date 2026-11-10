@@ -1,0 +1,25 @@
+# evlinger -- stay alive without touching the terminal or the loop: poll(2) of
+# no descriptors with a timeout, so a harness can inspect the terminal and the
+# program's descriptors after a case has finished.  The syscall is raw
+# authority, so it goes through a context of this module:
+#     with context evlinger::create()
+
+import std::abi::x86_64
+import std::linux::abi::x86_64
+
+private fn word64(n: int) -> std::abi::x86_64::Register64:
+    std::abi::x86_64::register64(n):
+        on std::abi::x86_64::Register64BelowRange:
+            std::abi::x86_64::register64(0)
+        on std::abi::x86_64::Register64AboveRange:
+            std::abi::x86_64::register64(0)
+
+opaque context struct Sleeper:
+    unused: bool
+
+fn create() -> Sleeper:
+    Sleeper {unused: true}
+
+fn linger(ms: int, context s: Sleeper):
+    std::linux::abi::x86_64::syscall({rax: word64(7), rdi: word64(0), rsi: word64(0), rdx: word64(ms)})
+    unit

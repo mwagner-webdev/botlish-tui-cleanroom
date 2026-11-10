@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "name": "consumer_evloop",
+  "version": "0.1.0",
+  "dependencies": {
+    "event_loop_linux": "0.5",
+    "tui": "0.2",
+    "tui_event_loop_linux": "0.1"
+  },
+  "lock": {
+    "event_loop_linux": "0.5.0",
+    "tui": "0.2.0",
+    "tui_event_loop_linux": "0.1.0"
+  },
+  "sources": {
+    "event_loop_linux": {
+      "archive": "../dist/upstream/event_loop_linux-0.5.0.botpkg",
+      "sha256": "ecd9e8114fa5bc24c2d23a2068e96ec2932e9386ca0cdb79fc568b9662146f77"
+    },
+    "tui": {
+      "archive": "../dist/tui-0.2.0.botpkg",
+      "sha256": "ddb64c66ff4459ef582b3e692d44c9b1012ce4eb5ac6ce4b761c14055b74e3d2"
+    },
+    "tui_event_loop_linux": {
+      "archive": "../dist/tui_event_loop_linux-0.1.0.botpkg",
+      "sha256": "a122b74a586e0dc55055cb22201336fc6dd547ab33746b67a4f7dc3eb10143fc"
+    }
+  }
+}

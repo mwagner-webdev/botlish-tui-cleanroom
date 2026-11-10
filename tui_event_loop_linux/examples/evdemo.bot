@@ -1,0 +1,198 @@
+# evdemo -- the tui package inside an application-owned std::event_loop.
+#
+#   botlish -emit-native-executable evdemo.bot && ./evdemo        (in a terminal)
+#
+# One loop, several tasks, one terminal:
+#   * the UI task (tui_event_loop_linux): owns the terminal, reads keys,
+#     applies events to monitor.bot's state machine, paints;
+#   * a ticker: a timer that posts a tick count every period;
+#   * a controller: reads the keys the UI task copies to it (the tap) and
+#     starts, pauses or cancels the stream, or asks for a repaint;
+#   * a stream: a simulated external source that posts one chunk per interval.
+# Nothing of that is a loop of its own: std::event_loop::run() below is the
+# program's only loop.  When the UI task ends (q), the producers see NotLive
+# from their next post and finish, run() returns, and the report is printed
+# after the terminal has been restored.
+#
+# Options (for the test harness): --total N chunks (default 100), --interval US
+# between chunks (40000), --tick US (250000), --autostart (start the stream at
+# once), --stamp (the stream also posts a microsecond timestamp of each chunk), --batch N
+# (chunks posted per interval: a burst), --linger MS (keep the loop alive MS after the UI ended and report
+# the watch events counted meanwhile).
+
+import event_loop_linux
+import control
+import monitor
+import std::event_loop
+import std::int
+import std::io
+import std::linux::io
+import std::list
+import std::str
+import tui::app
+import tui::input
+import tui::session
+import tui_event_loop_linux
+import type std::event_loop::Posted
+import type std::event_loop::Wake
+
+fn ticker(inbox: tui_event_loop_linux::Inbox, period: int, n: int, due: int, context ev: std::event_loop::Loop, ui: tui_event_loop_linux::Ui, nat: event_loop_linux::Native, ctl: control::Control) -> int errors std::event_loop::SchedulerFault:
+    std::event_loop::sleep(period)
+    now = event_loop_linux::now_us()
+    if due > 0:
+        control::record_late(now - due)
+    if inbox.notify(monitor::code_tick, n + 1) == Posted::NotLive:
+        return n
+    inbox.ticker(period, n + 1, now + period)
+
+# Post up to LEFT chunks after chunk N, in one go; returns the number of the last
+# chunk accepted, or -1 when the UI task has ended.  A refused post (the inbox
+# is full) stops the batch without losing the chunk: it is retried next time.
+fn emit(inbox: tui_event_loop_linux::Inbox, n: int, left: int, context ev: std::event_loop::Loop, ui: tui_event_loop_linux::Ui, ctl: control::Control, nat: event_loop_linux::Native) -> int errors std::event_loop::SchedulerFault:
+    if left <= 0 or n >= control::total():
+        return n
+    posted = inbox.notify(monitor::code_chunk, n + 1)
+    if posted == Posted::NotLive:
+        return -1
+    if posted != Posted::Accepted:
+        return inbox.emit(n, 0)
+    control::record_sent(n + 1)
+    if control::stamping?():
+        inbox.notify(monitor::code_stamp, event_loop_linux::now_us())
+    inbox.emit(n + 1, left - 1)
+
+# The simulated stream: BATCH chunks per interval while running; paused chunks
+# wait; a refused post is retried without losing the chunk.
+fn stream(inbox: tui_event_loop_linux::Inbox, n: int, context ev: std::event_loop::Loop, ui: tui_event_loop_linux::Ui, ctl: control::Control, nat: event_loop_linux::Native) -> int errors std::event_loop::SchedulerFault:
+    std::event_loop::sleep(control::interval())
+    state = control::state()
+    if state == monitor::stream_cancelled:
+        inbox.notify(monitor::code_stream, monitor::stream_cancelled)
+        return n
+    if state != monitor::stream_running:
+        return inbox.stream(n)
+    last = inbox.emit(n, control::batch())
+    if last < 0:
+        return -1
+    if last >= control::total():
+        control::set_state(monitor::stream_done)
+        inbox.notify(monitor::code_stream, monitor::stream_done)
+        return last
+    inbox.stream(last)
+
+fn start_stream(inbox: tui_event_loop_linux::Inbox, context ev: std::event_loop::Loop, ui: tui_event_loop_linux::Ui, ctl: control::Control, nat: event_loop_linux::Native) errors std::event_loop::SchedulerFault:
+    control::set_state(monitor::stream_running)
+    control::record_sent(0)
+    inbox.notify(monitor::code_stream, monitor::stream_running)
+    coroutine {step, first} = stream(inbox, 0)
+    std::event_loop::adopt(step, first)
+    unit
+
+fn command(inbox: tui_event_loop_linux::Inbox, key: tui::input::Event, context ev: std::event_loop::Loop, ui: tui_event_loop_linux::Ui, ctl: control::Control, nat: event_loop_linux::Native) errors std::event_loop::SchedulerFault:
+    state = control::state()
+    idle = state == monitor::stream_idle or state == monitor::stream_cancelled or state == monitor::stream_done
+    if key.is_char?(115) and idle:
+        inbox.start_stream()
+    if key.is_char?(112) and state == monitor::stream_running:
+        control::set_state(monitor::stream_paused)
+        inbox.notify(monitor::code_stream, monitor::stream_paused)
+    if key.is_char?(112) and state == monitor::stream_paused:
+        control::set_state(monitor::stream_running)
+        inbox.notify(monitor::code_stream, monitor::stream_running)
+    if key.is_char?(99) and (state == monitor::stream_running or state == monitor::stream_paused):
+        control::set_state(monitor::stream_cancelled)
+    if key.is_char?(114):
+        inbox.request_repaint()
+    if key.is_char?(100):
+        inbox.request_redraw()
+    unit
+
+# The controller: every terminal key, in order, from the UI task's tap.
+fn controller(inbox: tui_event_loop_linux::Inbox, tap: std::event_loop::Reg, context ev: std::event_loop::Loop, ui: tui_event_loop_linux::Ui, ctl: control::Control, nat: event_loop_linux::Native) -> int errors std::event_loop::SchedulerFault:
+    woke = std::event_loop::wait(tap)
+    if woke.reason == Wake::Revoked:
+        return 0
+    if woke.reason == Wake::Event:
+        inbox.command(tui::input::unpack(woke.a, woke.b))
+    inbox.controller(tap)
+
+# After the UI ended: note the watch events counted so far, stay alive MS
+# milliseconds, so a harness can type at the (restored) terminal meanwhile.
+fn linger(inbox: tui_event_loop_linux::Inbox, ms: int, context ev: std::event_loop::Loop, ui: tui_event_loop_linux::Ui, n: event_loop_linux::Native, ctl: control::Control) -> int errors std::event_loop::SchedulerFault:
+    std::event_loop::sleep(5000)
+    if inbox.running?():
+        return inbox.linger(ms)
+    control::set_mark(event_loop_linux::stats().watch_events)
+    std::event_loop::sleep(ms * 1000)
+    0
+
+fn number(args: List[str], name: str, default: int) -> int:
+    fold i from 0 to args.length() - 1 with intermediate found default:
+        if args.get(i, "") == name:
+            std::int::from_string(args.get(i + 1, "")):
+                on InvalidIntegerText:
+                    found
+        else:
+            found
+
+fn flag?(args: List[str], name: str) -> bool:
+    fold a in args with intermediate seen false:
+        seen or a == name
+
+fn say(text: str, context io: std::linux::io::LinuxIO):
+    std::io::print_line(text):
+        on std::io::WriteFailed:
+            unit
+
+fn main(args: List[str], context ev: std::event_loop::Loop, d: event_loop_linux::Linux, n: event_loop_linux::Native, t: tui::session::Terminal, ui: tui_event_loop_linux::Ui, ctl: control::Control, io: std::linux::io::LinuxIO) -> int errors std::event_loop::SchedulerFault, std::event_loop::DriverFault, std::event_loop::LoopReentered:
+    std::event_loop::sync()
+    inbox = tui_event_loop_linux::start(monitor::initial(control::total())):
+        on tui::session::NotATerminal {stream}:
+            say("evdemo: standard ".concat(stream).concat(" is not a terminal"))
+            return 2
+        on tui::session::IoFailed {operation}:
+            say("evdemo: terminal I/O failed during: ".concat(operation))
+            return 2
+        on tui::session::TerminalBusy {reason}:
+            say("evdemo: ".concat(reason))
+            return 2
+        on std::event_loop::DriverFault {code}:
+            say("evdemo: the readiness watch failed: driver fault ".concat(std::int::to_string(code)))
+            return 2
+    tap = inbox.tap()
+    coroutine {step: ticking, first: ticking_first} = ticker(inbox, args.number("--tick", 250000), 0, 0)
+    std::event_loop::adopt(ticking, ticking_first)
+    coroutine {step: controlling, first: controlling_first} = controller(inbox, tap)
+    std::event_loop::adopt(controlling, controlling_first)
+    if args.flag?("--autostart"):
+        inbox.start_stream()
+    lingering = args.number("--linger", 0)
+    if lingering > 0:
+        coroutine {step: waiting, first: waiting_first} = linger(inbox, lingering)
+        std::event_loop::adopt(waiting, waiting_first)
+    turns = std::event_loop::run()
+    outcome = inbox.outcome()
+    stats = inbox.stats()
+    say("REPORT outcome=".concat(std::int::to_string(outcome.code)).concat(" detail=").concat(outcome.detail).concat(" sent=").concat(std::int::to_string(control::sent())).concat(" delivered=").concat(std::int::to_string(stats.delivered)).concat(" posted=").concat(std::int::to_string(stats.events_posted)).concat(" refused=").concat(std::int::to_string(stats.refused)).concat(" terminal_events=").concat(std::int::to_string(stats.terminal_events)).concat(" frames=").concat(std::int::to_string(stats.frames)).concat(" bytes_out=").concat(std::int::to_string(stats.bytes_out)).concat(" bytes_in=").concat(std::int::to_string(stats.bytes_in)).concat(" wakes=").concat(std::int::to_string(stats.wakes)).concat(" redraw_requests=").concat(std::int::to_string(stats.redraw_requests)).concat(" redraw_posts=").concat(std::int::to_string(stats.redraw_posts)).concat(" size_changes=").concat(std::int::to_string(stats.size_changes)).concat(" write_blocks=").concat(std::int::to_string(stats.write_blocks)).concat(" escape_timeouts=").concat(std::int::to_string(stats.escape_timeouts)).concat(" tap_dropped=").concat(std::int::to_string(stats.tap_dropped)))
+    say("TIMER ".concat(control::late_report()))
+    if lingering > 0:
+        say("LINGER watch_events_after_release=".concat(std::int::to_string(event_loop_linux::stats().watch_events - control::mark())))
+    outcome.code
+
+args = argv():
+    on InvalidArgumentEncoding:
+        []
+with context std::event_loop::create(256)
+with context event_loop_linux::create()
+with context event_loop_linux::native()
+with context tui::session::create()
+with context tui_event_loop_linux::create()
+with context std::linux::io::create()
+with context control::create(args.number("--total", 100), args.number("--interval", 40000), args.flag?("--stamp"), args.number("--batch", 1))
+main(args):
+    on std::event_loop::SchedulerFault:
+        -2
+    on std::event_loop::DriverFault {code}:
+        -3
+    on std::event_loop::LoopReentered:
+        -4

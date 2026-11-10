@@ -16,18 +16,34 @@
 # Terminal state is owned by an `opaque resource struct` (Session) whose
 # cleanup restores the terminal when `run` leaves, normally or by an error.
 #
+# Two ways to run a session, one set of rules:
+#   * STANDALONE: `run(app)` owns a loop of its own (poll, read, update, draw).
+#     Appropriate when terminal interaction is the program's only activity.
+#   * EXTERNALLY DRIVEN: `open_driven` gives the Session without any loop; the
+#     program's own event loop decides when to read (read_bytes), write
+#     (write_some) and sample the size.  The descriptor is then nonblocking,
+#     so a read never waits and a write that cannot proceed says so.  The
+#     adapter package tui_event_loop_linux is that loop integration; this
+#     module knows nothing of any scheduler.
+# Both use the same decoder (tui::input), host (tui::host), renderer
+# (tui::display), ownership rule and cleanup.  One Terminal context has one
+# owner at a time: a second open fails (TerminalBusy / IoFailed "busy").
+#
 # Limits, stated honestly:
 #   * Resize is detected by sampling TIOCGWINSZ every resize_poll_ms while the
 #     terminal is idle (std programs run on a worker thread, so a SIGWINCH
 #     signalfd never sees the signal).  Resizes are noticed within that delay.
 #   * A lone Escape is resolved by silence: escape_timeout_ms (see tui::input).
 #   * Nothing can be restored after SIGKILL/SIGTERM or a crashed process.
+#   * Exclusive ownership is per Terminal context, that is per VM: another
+#     VM (thread) that installs its own Terminal is not stopped.
 #   * Interpreter and `compile` backends refuse the syscalls (NATIVE-ONLY):
 #     use -backend cranelift or build a native executable.
 
 import std::list
 import std::str
 import std::int
+import std::mutable_array
 import std::abi
 import std::abi::bytes
 import std::abi::x86_64
@@ -39,6 +55,7 @@ import tui::canvas
 import tui::ansi
 import tui::input
 import tui::app
+import tui::host
 
 escape_timeout_ms = 50
 resize_poll_ms = 100
@@ -51,14 +68,33 @@ error NotATerminal:
 error IoFailed:
     operation: str
 
+private fn descriptor(n: int) -> std::abi::I32:
+    std::abi::i32(n):
+        on std::abi::AbiIntegerBelowRange:
+            std::abi::i32(-1)
+        on std::abi::AbiIntegerAboveRange:
+            std::abi::i32(-1)
+
+# Another session already owns this Terminal (open_driven).
+error TerminalBusy:
+    reason: str
+
+# owner[0] is 1 while a Session made from this Terminal is alive.
 opaque context struct Terminal:
     input_fd: std::abi::I32
     output_fd: std::abi::I32
+    owner: MutableArray[int]
 
 # The terminal authority.  Install it once, before any session call:
 #     with context tui::session::create()
 fn create() -> Terminal:
-    Terminal {input_fd: std::abi::i32(0), output_fd: std::abi::i32(1)}
+    Terminal {input_fd: std::abi::i32(0), output_fd: std::abi::i32(1), owner: std::mutable_array::from_list([0])}
+
+# A Terminal on other descriptors than standard input and output (a terminal
+# opened by the program; descriptors that are not terminals, to test the
+# failure paths).  A number outside a C int is the descriptor -1.
+fn create_on(input: int, output: int) -> Terminal:
+    Terminal {input_fd: descriptor(input), output_fd: descriptor(output), owner: std::mutable_array::from_list([0])}
 
 layout Termios:
     size 36
@@ -98,8 +134,11 @@ struct Size:
     width: int
     height: int
 
+# saved: the terminal's original termios.  flags: the input descriptor's
+# original status flags when the session made it nonblocking, else -1.
 opaque resource struct Session:
     saved: std::abi::bytes::Bytes
+    flags: int
 
 private fn word(n: int) -> std::abi::x86_64::Register64:
     std::abi::x86_64::register64(n):
@@ -122,13 +161,26 @@ private fn ioctl(fd: std::abi::I32, request: int, buf: std::abi::bytes::MutableB
     rc = std::linux::abi::x86_64::syscall({rax: word(16), rdi: word(fd.value), rsi: word(request), rdx: std::abi::x86_64::from_mutable_bytes(d)})
     Sys {rc: std::abi::x86_64::to_int(rc), data: d}
 
-# poll(2) of one descriptor for input, TIMEOUT milliseconds; the raw result.
-private fn poll_input(fd: std::abi::I32, timeout: int, context term: Terminal) -> int:
-    request = std::binary::emit(LayoutStruct[PollFd] {fd: fd.value, events: 1, revents: 0}):
+# poll(2) of one descriptor for EVENTS (1 input, 4 output), TIMEOUT
+# milliseconds; the raw result.
+private fn poll_fd(fd: std::abi::I32, events: int, timeout: int, context term: Terminal) -> int:
+    mask = if events >= 0 and events <= 32767:
+        events
+    else:
+        0
+    request = std::binary::emit(LayoutStruct[PollFd] {fd: fd.value, events: mask, revents: 0}):
         on LayoutExtentMismatch:
             return -22
     d = std::abi::bytes::from_bytes(request)
     rc = std::linux::abi::x86_64::syscall({rax: word(7), rdi: std::abi::x86_64::from_mutable_bytes(d), rsi: word(1), rdx: word(timeout)})
+    std::abi::x86_64::to_int(rc)
+
+private fn poll_input(fd: std::abi::I32, timeout: int, context term: Terminal) -> int:
+    fd.poll_fd(1, timeout)
+
+# fcntl(2) F_GETFL / F_SETFL of the input descriptor: the raw result.
+private fn fcntl(fd: std::abi::I32, command: int, argument: int, context term: Terminal) -> int:
+    rc = std::linux::abi::x86_64::syscall({rax: word(72), rdi: word(fd.value), rsi: word(command), rdx: word(argument)})
     std::abi::x86_64::to_int(rc)
 
 # read(2) of up to the buffer's length from FD.
@@ -231,27 +283,117 @@ private fn prelude() -> str:
 private fn postlude() -> str:
     tui::ansi::reset_style().concat(tui::ansi::enable_wrap()).concat(tui::ansi::show_cursor()).concat(tui::ansi::leave_alternate_screen())
 
-# Restores the terminal: screen state first, then the saved termios.  Runs
-# automatically where the Session's owner ends, including after an error.
-cleanup fn restore(session: Session, context term: Terminal):
-    {saved} = session
-    write_text(postlude()):
-        on IoFailed:
-            unit
-    apply_termios(std::abi::bytes::from_bytes(saved))
+# --- ownership: one Session per Terminal context
+
+private fn owner_state(context term: Terminal) -> int:
+    term.owner.at(0):
+        on IndexNotFound:
+            1
+
+private fn set_owner(state: int, context term: Terminal):
+    term.owner.set(0, state):
+        on IndexNotFound:
+            return unit
     unit
+
+# Take the Terminal: false when a Session already owns it.
+private fn claim(context term: Terminal) -> bool:
+    if owner_state() != 0:
+        return false
+    set_owner(1)
+    true
+
+# True while a Session made from this Terminal is alive.
+fn owned?(context term: Terminal) -> bool:
+    owner_state() != 0
+
+# --- cleanup
+
+# Write DATA to the output with a bounded patience (at most about one second
+# in all, however often the terminal refuses): a cleanup must never hang on a
+# terminal that stopped draining its output.
+private fn write_bounded(data: std::abi::bytes::Bytes, budget: int, context term: Terminal):
+    total = std::abi::bytes::length(data).value
+    if total == 0 or budget <= 0:
+        return unit
+    n = term.output_fd.write_once(data)
+    if n == -4:
+        return data.write_bounded(budget - 1)
+    if n == -11:
+        term.output_fd.poll_fd(4, 50)
+        return data.write_bounded(budget - 1)
+    if n <= 0 or n >= total:
+        return unit
+    rest = data.slice(n, total):
+        on LowerUnderrun:
+            return unit
+        on UpperOverrun:
+            return unit
+    rest.write_bounded(budget)
+
+# Restores the terminal: screen state first, then the input descriptor's
+# original flags, then the saved termios, and finally gives up the ownership.
+# Runs automatically where the Session's owner ends, including after an error,
+# a cancelled task and an abandoned coroutine.  An externally driven session's
+# descriptor is nonblocking, so its screen restore is written with a bounded
+# patience; a standalone session's is an ordinary blocking write.
+cleanup fn restore(session: Session, context term: Terminal):
+    {saved, flags} = session
+    if flags >= 0:
+        text_bytes(postlude()).write_bounded(20)
+        term.input_fd.fcntl(4, flags)
+    else:
+        write_text(postlude()):
+            on IoFailed:
+                unit
+    apply_termios(std::abi::bytes::from_bytes(saved))
+    set_owner(0)
+    unit
+
+# Put the terminal in raw mode on the alternate screen, claiming it.  DRIVEN
+# also makes the input descriptor nonblocking (after the first screen write).
+private fn start(driven: bool, context term: Terminal) -> Session errors NotATerminal, IoFailed, TerminalBusy:
+    if not claim():
+        fail TerminalBusy {reason: "a session already owns this terminal"}
+    saved = query_termios():
+        on NotATerminal {stream}:
+            set_owner(0)
+            fail NotATerminal {stream: stream}
+    size = query_size():
+        on NotATerminal {stream}:
+            set_owner(0)
+            fail NotATerminal {stream: stream}
+    if apply_termios(raw_termios(saved)) < 0:
+        set_owner(0)
+        fail IoFailed {operation: "configure"}
+    original = if driven:
+        term.input_fd.fcntl(3, 0)
+    else:
+        -1
+    session = Session {saved: std::abi::bytes::freeze(saved), flags: original}
+    write_text(prelude())
+    if driven and (original < 0 or term.input_fd.fcntl(4, bit_or(original, 2048)) < 0):
+        fail IoFailed {operation: "nonblocking"}
+    session
 
 # Put the terminal in raw mode on the alternate screen.  The returned Session
 # is the obligation to restore it (a resource: it is released at the end of
-# the scope that owns it).
+# the scope that owns it).  Fails with IoFailed "busy" when this Terminal
+# already has a Session.
 fn open(context term: Terminal) -> Session errors NotATerminal, IoFailed:
-    saved = query_termios()
-    size = query_size()
-    if apply_termios(raw_termios(saved)) < 0:
-        fail IoFailed {operation: "configure"}
-    session = Session {saved: std::abi::bytes::freeze(saved)}
-    write_text(prelude())
-    session
+    start(false):
+        on TerminalBusy {reason}:
+            fail IoFailed {operation: "busy"}
+
+# As open, for a program whose own event loop drives the terminal: the input
+# descriptor is also made nonblocking (its original flags are restored by the
+# Session's cleanup), so that read_bytes never waits.  There is no loop here:
+# see read_bytes, write_some, size and tui::host.  Fails with TerminalBusy when
+# this Terminal already has a Session.
+fn open_driven(context term: Terminal) -> Session errors NotATerminal, IoFailed, TerminalBusy:
+    start(true)
+
+# --- input
 
 private struct Chunk:
     count: int
@@ -270,63 +412,134 @@ private fn read_chunk(context term: Terminal) -> Chunk:
         tui::text::widen(parsed.bytes.get(i, 0))
     Chunk {count: r.rc, bytes: bytes}
 
-# What one wait for input produced.
-private struct Woke:
-    decoder: tui::input::Decoder
-    events: List[tui::input::Event]
-    size: Size
-    closed: bool
+# What one read of the input found.
+#   Data    bytes were read
+#   Idle    nothing to read right now (a nonblocking descriptor; also EINTR)
+#   Closed  end of file: no more input will come
+#   Hangup  the terminal went away (EIO)
+enum Reading:
+    Data,
+    Idle,
+    Closed,
+    Hangup,
 
-private fn resized(old: Size, now: Size) -> List[tui::input::Event]:
-    if old.width != now.width or old.height != now.height:
-        return [tui::input::resize(now.width, now.height)]
-    []
+struct Input:
+    state: Reading
+    bytes: List[int]
+
+# One read(2) of at most 64 bytes, bytes as 0..255.  Never waits on a
+# descriptor made nonblocking by open_driven: absence of input is Idle, never
+# Closed.  Any other failure of the read is IoFailed "read".
+fn read_bytes(context term: Terminal) -> Input errors IoFailed:
+    chunk = read_chunk()
+    if chunk.count == 0:
+        return Input {state: Reading::Closed, bytes: []}
+    if chunk.count == -4 or chunk.count == -11:
+        return Input {state: Reading::Idle, bytes: []}
+    if chunk.count == -5:
+        return Input {state: Reading::Hangup, bytes: []}
+    if chunk.count < 0:
+        fail IoFailed {operation: "read"}
+    Input {state: Reading::Data, bytes: chunk.bytes}
+
+# The descriptors this Terminal reads and writes (to watch for readiness).
+fn input_descriptor(context term: Terminal) -> int:
+    term.input_fd.value
+
+fn output_descriptor(context term: Terminal) -> int:
+    term.output_fd.value
+
+# --- output
+
+# TEXT (trusted terminal output) as bytes, to write with write_some.
+fn encode(text: str) -> std::abi::bytes::Bytes:
+    text_bytes(text)
+
+fn encoded_length(data: std::abi::bytes::Bytes) -> int:
+    std::abi::bytes::length(data).value
+
+# One write(2) of the bytes of DATA from OFFSET, at most LIMIT of them.
+# Returns the new offset: unchanged when the terminal cannot take anything now
+# (a nonblocking output that is full: wait until it is writable, then call
+# again).  Writing a frame in several calls is correct because the caller keeps
+# the offset; a frame that is abandoned half-written leaves the terminal in an
+# unknown state (tui::host::frame_failed).  IoFailed "write" when the terminal
+# is gone.
+fn write_some(data: std::abi::bytes::Bytes, offset: int, limit: int, context term: Terminal) -> int errors IoFailed:
+    total = std::abi::bytes::length(data).value
+    if offset >= total or limit <= 0:
+        return offset
+    stop = if offset + limit < total:
+        offset + limit
+    else:
+        total
+    part = data.slice(offset, stop):
+        on LowerUnderrun:
+            fail IoFailed {operation: "write offset"}
+        on UpperOverrun:
+            fail IoFailed {operation: "write length"}
+    n = term.output_fd.write_once(part)
+    refused = n == -4 or n == -11
+    if n <= 0 and not refused:
+        fail IoFailed {operation: "write"}
+    progress = if refused:
+        0
+    else:
+        n
+    offset + progress
+
+# --- the standalone loop
+
+# The size at wake-up as one more transition: FIRST's events, then a Resize
+# event when the size changed.
+private fn with_size(first: tui::host::Fed, now: Size) -> tui::host::Fed:
+    second = first.host.resized(now.width, now.height)
+    tui::host::Fed {host: second.host, events: [first.events, second.events].flat()}
 
 # Wait up to the idle timeout for input (bytes are decoded, a lone Escape is
-# resolved by the escape timeout) and report the size at wake-up.
-private fn wait(decoder: tui::input::Decoder, current: Size, context term: Terminal) -> Woke errors NotATerminal, IoFailed:
-    timeout = if tui::input::pending?(decoder):
+# resolved by the escape timeout) and report the size at wake-up.  The events
+# are for the application, in order.
+private nomethod fn wait(host: tui::host::Host, context term: Terminal) -> tui::host::Fed errors NotATerminal, IoFailed:
+    timeout = if host.pending_input?():
         50
     else:
         100
     rc = term.input_fd.poll_input(timeout)
     now = query_size()
     if rc == 0 or rc == -4:
-        flushed = tui::input::flush(decoder)
-        return Woke {decoder: flushed.decoder, events: [flushed.events, current.resized(now)].flat(), size: now, closed: false}
+        return host.silence().with_size(now)
     if rc < 0:
         fail IoFailed {operation: "poll"}
-    chunk = read_chunk()
-    if chunk.count == 0:
-        flushed = tui::input::flush(decoder)
-        return Woke {decoder: flushed.decoder, events: flushed.events, size: now, closed: true}
-    if chunk.count == -4 or chunk.count == -11:
-        return Woke {decoder: decoder, events: current.resized(now), size: now, closed: false}
-    if chunk.count < 0:
+    read = read_bytes()
+    if read.state == Reading::Closed:
+        return host.end_of_input()
+    if read.state == Reading::Hangup:
         fail IoFailed {operation: "read"}
-    fed = decoder.feed(chunk.bytes)
-    Woke {decoder: fed.decoder, events: [fed.events, current.resized(now)].flat(), size: now, closed: false}
+    if read.state == Reading::Idle:
+        return tui::host::Fed {host: host, events: []}.with_size(now)
+    host.feed(read.bytes).with_size(now)
 
-private nomethod fn drive(app: tui::app::Application, decoder: tui::input::Decoder, shown: tui::canvas::Screen, size: Size, dirty: bool, context term: Terminal) -> unit errors NotATerminal, IoFailed, tui::app::Abort:
-    if app.finished?():
+private nomethod fn drive(app: tui::app::Application, host: tui::host::Host, context term: Terminal) -> unit errors NotATerminal, IoFailed, tui::app::Abort:
+    if host.done?(app):
         return unit
-    now_shown = if dirty:
-        next = app.view(size.width, size.height).rasterize()
-        write_text(shown.diff(next))
-        next
+    shown = if host.wants_frame?(app):
+        frame = host.frame(app)
+        write_text(frame.text):
+            on IoFailed {operation}:
+                fail IoFailed {operation: operation}
+        frame.host
     else:
-        shown
-    woke = decoder.wait(size)
-    next_app = tui::app::apply_events(app, woke.events, 0)
-    if woke.closed:
-        return unit
-    drive(next_app, woke.decoder, now_shown, woke.size, woke.events.length() > 0)
+        host
+    woke = wait(shown)
+    next = tui::app::apply_events(app, woke.events, 0)
+    drive(next, woke.host)
 
 # Run APP in the terminal until finished?(app) is true or the input ends.  The
 # terminal is restored before run returns or fails.  Fails with NotATerminal
 # when stdin/stdout are not terminals, IoFailed when the terminal cannot be
-# configured, read or written, and tui::app::Abort when the application's update fails.
+# configured, read or written (or is already owned by another session), and
+# tui::app::Abort when the application's update fails.
 fn run(app: tui::app::Application, context term: Terminal) -> unit errors NotATerminal, IoFailed, tui::app::Abort:
     session = open()
-    start = query_size()
-    drive(app, tui::input::new_decoder(), tui::canvas::blank(0, 0), start, true)
+    start_size = query_size()
+    drive(app, tui::host::new(start_size.width, start_size.height))

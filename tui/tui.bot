@@ -1,4 +1,4 @@
-# tui 0.1.0 -- a reusable terminal UI library written entirely in Botlish.
+# tui 0.2.0 -- a reusable terminal UI library written entirely in Botlish.
 #
 # Import the module you need, by its full name (Botlish has no re-exports):
 #
@@ -11,11 +11,15 @@
 #     tui::layout   immutable layout trees: label, stacks, boxes, padding, flex
 #     tui::widgets  Focus, button, TextInput, ListState, status bar
 #     tui::app      the Application interface (update / view / finished?)
+#     tui::display what the terminal shows; the bytes that change it (diff)
+#     tui::host    the bookkeeping of a session: decode, resize, frames (pure)
 #
 #   Layer B -- the Linux terminal adapter (native backends, a real terminal)
-#     tui::session  Terminal context, run(app), raw mode, resize, restore
+#     tui::session  Terminal context, run(app), raw mode, resize, restore;
+#                   open_driven / read_bytes / write_some for a program whose
+#                   own event loop drives the terminal (see tui_event_loop_linux)
 #
 # Start with README.md and GUIDE.md in this package; examples/ holds a complete
 # task-list application and runnable guide programs.
 
-version = "0.1.0"
+version = "0.2.0"

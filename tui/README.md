@@ -1,13 +1,13 @@
 # tui — a terminal UI library in pure Botlish
 
-`tui` 0.1.0 draws text user interfaces from ordinary immutable Botlish values.
+`tui` 0.2.0 draws text user interfaces from ordinary immutable Botlish values.
 It is written entirely in Botlish (no C, no FFI, no native code, no external
-tools) and is distributed as one `tui-0.1.0.botpkg`.
+tools) and is distributed as one `tui-0.2.0.botpkg`.
 
 It has two layers:
 
 * **Layer A — portable, pure.** `style`, `text`, `canvas`, `ansi`, `input`,
-  `layout`, `widgets`, `app`. They turn values into a screen, a screen into
+  `layout`, `widgets`, `app`, `display`, `host`. They turn values into a screen, a screen into
   ANSI bytes, and bytes into events. No terminal is needed; they run on every
   backend (`interp`, `compile`, `cranelift`, `cranelift-generic`) and are tested
   without one.
@@ -24,8 +24,10 @@ It has two layers:
 | OS | any the compiler runs on | Linux x86-64 (raw syscalls) |
 | Needs a terminal | no | yes (stdin and stdout must be terminals) |
 
-Tested with the single-file compiler `botlish-linux-x86_64` (development build,
-revision 2a10335). The package has no dependencies.
+Tested with the single-file compiler `botlish-linux-x86_64` (development build;
+`botlish -version` of the build used for 0.2.0 is recorded in the milestone report).
+The package has no dependencies. 0.2.0 was also spot-checked with the older
+`single-latest` build of 2026-10-21 (`bdd5e3d`): `test_host`, `test_input`, `test_session` pass.
 
 ## Install
 
@@ -33,7 +35,7 @@ In a project (a directory with a `botlish.json`) put the artifact next to it, or
 point at it, and add it with the package manager:
 
 ```sh
-./botlish-linux-x86_64 add path/to/tui-0.1.0.botpkg
+./botlish-linux-x86_64 add path/to/tui-0.2.0.botpkg
 ./botlish-linux-x86_64 verify
 ```
 
@@ -53,7 +55,7 @@ import tui::layout
 import tui::widgets
 ```
 
-`tui.bot` documents the module list; `tui::version` is `"0.1.0"`.
+`tui.bot` documents the module list; `tui::version` is `"0.2.0"`.
 
 ## A small working example
 
@@ -112,6 +114,37 @@ error is reported.
 Without a terminal (`./demo < /dev/null`) the demo prints one frame as plain text
 and says so.
 
+## Two ways to run an application
+
+* **Standalone** — `tui::session::run(app)`: the library owns a small loop
+  (poll, read, update, draw). Right for a program whose only ongoing activity is
+  the terminal. Everything above is unchanged from 0.1.0.
+* **Inside the program's own event loop** — the optional package
+  **`tui_event_loop_linux`** (depends on this package and on the published
+  `event_loop_linux` driver) makes the terminal one participant of a
+  `std::event_loop`: terminal readiness, timers, streams and other tasks are
+  events of one loop and any of them can request a redraw. This package stays
+  dependency-free; the loop integration is a separate package so that
+  standalone consumers do not take on `event_loop_linux`'s native archive.
+
+Both modes use the same decoder (`tui::input`), the same state machine
+(`tui::host`), the same renderer (`tui::display`, `tui::ansi`), the same terminal
+ownership and cleanup (`tui::session`). What 0.2.0 adds for the second mode,
+without a scheduler anywhere in this package:
+
+| addition | what |
+|---|---|
+| `tui::input::Kind::Custom`, `custom(code, value)` | an application-defined event, delivered by an event loop to `update` like a key |
+| `tui::input::pack` / `unpack` | an event as two ints (to cross an event loop's `post(reg, a, b)`) |
+| `tui::display` | the renderer's memory between frames: `plan` (diff), `invalidate` |
+| `tui::host` | the pure bookkeeping of a session: `feed`, `silence`, `resized`, `deliver`, `end_of_input`, `frame`, `frame_failed`, `repaint` |
+| `tui::session::open_driven` | the Session for an externally driven program: nonblocking input descriptor (flags restored on release) |
+| `tui::session::read_bytes`, `write_some` | one nonblocking read / one write step: never wait |
+| `tui::session::create_on`, `owned?`, `TerminalBusy` | a Terminal on other descriptors; exclusive ownership (a second `open` fails: `IoFailed "busy"` from the 0.1.0 functions, `TerminalBusy` from `open_driven`) |
+
+0.1.0 programs compile and behave as before: no existing signature changed
+(the full 0.1.0 acceptance suite, 26 PTY checks, passes unmodified on 0.2.0).
+
 ## What is portable and what is not
 
 Portable (Layer A): everything except `tui::session`. Importing any Layer A
@@ -141,12 +174,15 @@ limitations).
   combining marks, CJK/wide and fullwidth characters, emoji, control characters —
   is displayed as `U+FFFD` (one cell). It never claims Unicode correctness.
 * **Resize** is noticed by sampling the window size every 100 ms while idle (a
-  `SIGWINCH` signal is not available to programs running on the worker thread).
+  `SIGWINCH` signal is not available to programs running on the worker thread);
+  `tui_event_loop_linux` samples on the application's loop timer instead.
 * **A lone Escape** is resolved after 50 ms of silence (`tui::input` documents
   the policy).
 * **Terminal restore** happens on normal exit and on errors that leave `run`
   (including an application's `fail tui::app::Abort`). It cannot happen after
   `SIGKILL`/`SIGTERM`; recover with `reset`.
+* **One owner per `Terminal` context** (per VM): a second session in the same VM is
+  refused; another thread's own `Terminal` is not stopped.
 * **No mouse, no bracketed paste, no 24-bit colour, no Windows/macOS.**
 * **Compiler quirk (native backends).** Because `tui::session` declares a
   resource whose cleanup requires a context, a native-backend program that
@@ -165,7 +201,7 @@ failed") and an external PTY driver:
 
 ```sh
 cp .bot_modules/tui/tests/test_*.bot .
-for t in test_canvas test_ansi test_input test_layout test_widgets; do
+for t in test_canvas test_ansi test_input test_layout test_widgets test_host; do
   ./botlish-linux-x86_64 -backend cranelift $t.bot | grep -o '[0-9]* passed, [0-9]* failed'
 done
 ./botlish-linux-x86_64 -backend cranelift test_session.bot < /dev/null   # adapter without a terminal

@@ -1,0 +1,584 @@
+# tui_event_loop_linux -- the terminal as a participant in an application's
+# std::event_loop (Linux; native backends).
+#
+#   with context std::event_loop::create(64)
+#   with context event_loop_linux::create()          the driver
+#   with context event_loop_linux::native()          readiness watches
+#   with context tui::session::create()              the terminal authority
+#
+#   inbox = tui_event_loop_linux::start(app)         open, spawn the UI task
+#   ... adopt the application's own tasks, handing them `inbox` ...
+#   std::event_loop::run()                           the APPLICATION's loop
+#   outcome = tui_event_loop_linux::outcome(inbox)
+#
+# WHO OWNS WHAT.  The application owns the loop: this module never runs, turns
+# or waits for it; it registers sources and adopts tasks, nothing more.  The
+# UI task (serve) owns the terminal: the tui::session::Session (raw mode,
+# nonblocking descriptor, alternate screen), the input and output readiness
+# watches and the registrations they deliver to.  Every other task reaches the
+# terminal only through an Inbox, a copyable handle that can post events and
+# redraw requests and can do nothing else.  So there is exactly one reader of
+# the input descriptor and exactly one writer of terminal bytes.
+#
+# HOW THINGS ARRIVE.  The UI task waits on ONE registration (the inbox, a
+# Reliable source) and the only thing it ever waits on is that registration:
+#   * terminal readable   native record from the input watch  -> read, decode
+#   * terminal writable   native record from the output watch -> go on writing
+#   * an application event  send(inbox, event)                -> update
+#   * a redraw request      request_redraw(inbox)             -> repaint
+#   * the terminal size     a ticker task samples TIOCGWINSZ  -> Resize event
+#   * the escape timeout    a one-shot timer after a held ESC -> Escape key
+#   * a close request       request_close(inbox)              -> leave
+# All of them go through the same state machine (tui::host), the same decoder
+# (tui::input) and the same renderer (tui::display) as tui::session::run.
+#
+# CODES (outcome): 0 the application finished, 1 the input ended (end of file
+# or hangup), 2 the application's update failed (tui::app::Abort), 3 the
+# terminal failed (IoFailed), 4 close requested, 5 the loop revoked the inbox
+# (shutdown), 6 the driver failed, 7 not a terminal.  detail(inbox) names the
+# reason of 2, 3 and 6.
+#
+# Nothing here blocks: reads and writes are nonblocking, waiting is the loop's.
+
+import event_loop_linux
+import std::event_loop
+import std::list
+import std::mutable_array
+import std::abi::bytes
+import std::int
+import std::str
+import tui::app
+import tui::host
+import tui::input
+import tui::session
+import type std::event_loop::Delivery
+import type std::event_loop::Wake
+import type std::event_loop::Posted
+
+# --- the inbox protocol
+#
+# A record of the inbox is (a, b).  Native readiness records have a = 1..15
+# (1 readable, 2 writable, 4 hangup, 8 error; b = the descriptor).  Records
+# posted by Botlish code have the tag in the low five bits of a (16..31).
+
+tag_event = 16
+tag_redraw = 17
+tag_size = 18
+tag_escape = 19
+tag_close = 20
+tag_retry = 21
+tag_repaint = 22
+
+inbox_capacity = 256
+tap_capacity = 256
+size_poll_us = 100000
+escape_timeout_us = 50000
+write_chunk = 16384
+read_budget = 2
+event_budget = 64
+
+# Indices of Inbox.cells.
+cell_redraw = 0
+cell_outcome = 1
+cell_escape = 2
+cell_tap = 3
+cell_frames = 4
+cell_bytes_out = 5
+cell_bytes_in = 6
+cell_events_in = 7
+cell_posted = 8
+cell_redraw_requests = 9
+cell_redraw_posts = 10
+cell_size_changes = 11
+cell_write_blocks = 12
+cell_tap_dropped = 13
+cell_wakes = 14
+cell_escape_timeouts = 15
+cell_partial_writes = 16
+cell_refused = 17
+cell_delivered = 18
+cell_repaint = 19
+cell_cells = 20
+
+# The handle every task other than the UI task holds: copy it freely.  Its
+# operations need only the Loop.
+struct Inbox:
+    reg: std::event_loop::Reg
+    tap_reg: std::event_loop::Reg
+
+# The shared counters and the outcome: a context, because a collection is a
+# value in Botlish and only an installed context is storage that every task
+# of the loop sees.  Install it once, beside the driver:
+#     with context tui_event_loop_linux::create()
+opaque context struct Ui:
+    cells: MutableArray[int]
+    detail: MutableArray[str]
+
+fn create() -> Ui:
+    Ui {cells: std::mutable_array::create(cell_cells, 0), detail: std::mutable_array::create(1, "")}
+
+# Counters (stats): what the UI task did.
+struct Stats:
+    frames: int
+    bytes_out: int
+    bytes_in: int
+    terminal_events: int
+    events_posted: int
+    redraw_requests: int
+    redraw_posts: int
+    size_changes: int
+    write_blocks: int
+    partial_writes: int
+    tap_dropped: int
+    wakes: int
+    escape_timeouts: int
+    refused: int
+    delivered: int
+
+# How the UI task ended.
+struct Outcome:
+    code: int
+    detail: str
+
+# What the UI task needs beyond its own arguments; plain data, copyable.
+struct Ports:
+    inbox: Inbox
+    input_watch: event_loop_linux::Watch
+    output_watch: event_loop_linux::Watch
+    separate_output: bool
+    tap: std::event_loop::Reg
+    tick: std::event_loop::Reg
+
+private nomethod fn cell(index: int, context ui: Ui) -> int:
+    ui.cells.at(index):
+        on IndexNotFound:
+            0
+
+private nomethod fn set_cell(index: int, value: int, context ui: Ui):
+    ui.cells.set(index, value):
+        on IndexNotFound:
+            return unit
+    unit
+
+private nomethod fn bump(index: int, context ui: Ui):
+    set_cell(index, cell(index) + 1)
+
+private nomethod fn add(index: int, amount: int, context ui: Ui):
+    set_cell(index, cell(index) + amount)
+
+nomethod fn new_inbox(reg: std::event_loop::Reg, tap_reg: std::event_loop::Reg) -> Inbox:
+    Inbox {reg: reg, tap_reg: tap_reg}
+
+private nomethod fn tagged(tag: int, payload: int) -> int:
+    tag + payload.shift_left(5)
+
+# --- what any task may do
+
+# Deliver EVENT to the application's update function, in order with the
+# terminal's own events.  Posted::Accepted, or Refused when the inbox is full
+# (the caller decides: try again later, or drop), NotLive when the UI task has
+# ended and the inbox is revoked: a producer that sees NotLive should stop.
+fn send(inbox: Inbox, event: tui::input::Event, context ui: Ui) -> Posted errors std::event_loop::SchedulerFault:
+    packed = tui::input::pack(event)
+    result = inbox.reg.post(tagged(tag_event, packed.a), packed.b)
+    if result == Posted::Refused:
+        bump(cell_refused)
+    if result == Posted::Accepted:
+        bump(cell_posted)
+    result
+
+# send of a Custom event: CODE says what happened, VALUE carries a number.
+fn notify(inbox: Inbox, code: int, value: int, context ui: Ui) -> Posted errors std::event_loop::SchedulerFault:
+    inbox.send(tui::input::custom(code, value))
+
+# Ask for a repaint although no event reached the application (state kept
+# elsewhere changed).  Requests made before the UI task gets to run are
+# coalesced into one record, and the repaint itself into one frame.  Always
+# returns at once.
+fn request_redraw(inbox: Inbox, context ui: Ui) -> Posted errors std::event_loop::SchedulerFault:
+    bump(cell_redraw_requests)
+    if cell(cell_redraw) != 0:
+        return Posted::Coalesced
+    set_cell(cell_redraw, 1)
+    bump(cell_redraw_posts)
+    result = inbox.reg.post(tagged(tag_redraw, 0), 0)
+    if result != Posted::Accepted:
+        set_cell(cell_redraw, 0)
+    result
+
+# Ask for a repaint of EVERY cell (the terminal's contents can no longer be
+# trusted: something else wrote to it).  Coalesced like request_redraw.
+fn request_repaint(inbox: Inbox, context ui: Ui) -> Posted errors std::event_loop::SchedulerFault:
+    if cell(cell_repaint) != 0:
+        return Posted::Coalesced
+    set_cell(cell_repaint, 1)
+    result = inbox.reg.post(tagged(tag_repaint, 0), 0)
+    if result != Posted::Accepted:
+        set_cell(cell_repaint, 0)
+    result
+
+# Ask the UI task to leave (an orderly shutdown from another task).
+fn request_close(inbox: Inbox) -> Posted errors std::event_loop::SchedulerFault:
+    inbox.reg.post(tagged(tag_close, 0), 0)
+
+# True while the UI task has not ended.
+fn running?(inbox: Inbox, context ui: Ui) -> bool:
+    cell(cell_outcome) == 0
+
+# How the UI task ended (code 0 is also what a task that has not ended yet
+# reports: check running?).
+fn outcome(inbox: Inbox, context ui: Ui) -> Outcome:
+    code = cell(cell_outcome)
+    text = ui.detail.at(0):
+        on IndexNotFound:
+            ""
+    Outcome {code: code - 1, detail: text}
+
+# The channel that carries a copy of every decoded terminal event to a
+# controller task (events packed with tui::input::pack, as (a, b)); wait on it
+# with std::event_loop::wait and decode with tui::input::unpack.  Bounded: when
+# the controller falls behind by tap_capacity events the excess copies are
+# dropped and counted (stats.tap_dropped).  The application itself never
+# loses an event; only this extra copy can.  Call before the first key.
+fn tap(inbox: Inbox, context ui: Ui) -> std::event_loop::Reg:
+    set_cell(cell_tap, 1)
+    inbox.tap_reg
+
+fn stats(inbox: Inbox, context ui: Ui) -> Stats:
+    Stats {frames: cell(cell_frames), bytes_out: cell(cell_bytes_out), bytes_in: cell(cell_bytes_in), terminal_events: cell(cell_events_in), events_posted: cell(cell_posted), redraw_requests: cell(cell_redraw_requests), redraw_posts: cell(cell_redraw_posts), size_changes: cell(cell_size_changes), write_blocks: cell(cell_write_blocks), partial_writes: cell(cell_partial_writes), tap_dropped: cell(cell_tap_dropped), wakes: cell(cell_wakes), escape_timeouts: cell(cell_escape_timeouts), refused: cell(cell_refused), delivered: cell(cell_delivered)}
+
+# --- the terminal's owner
+
+# Everything the UI task owns: released where the task ends, however it ends
+# (return, declared failure, a cancelled or abandoned task, a failed open).
+opaque resource struct Attached:
+    tick: std::event_loop::Owner
+    tap: std::event_loop::Owner
+    source: std::event_loop::Owner
+    session: tui::session::Session
+    input_watch: event_loop_linux::Watch
+    output_watch: event_loop_linux::Watch
+    separate_output: bool
+
+struct Opened:
+    attached: Attached
+    ports: Ports
+
+# Stop the watches first (no readiness record after this), then restore the
+# terminal (screen, descriptor flags, termios, ownership), then revoke the
+# registrations: waiters wake with Wake::Revoked and every later post is
+# NotLive.
+cleanup fn detach(attached: Attached, context n: event_loop_linux::Native, ev: std::event_loop::Loop, term: tui::session::Terminal):
+    {tick, tap, source, session, input_watch, output_watch, separate_output} = attached
+    event_loop_linux::unwatch(input_watch)
+    if separate_output:
+        event_loop_linux::unwatch(output_watch)
+    tui::session::restore(session)
+    unit
+
+# open, watching descriptor WATCHED for input readiness instead of the
+# terminal's own (a descriptor the program multiplexes; the failure tests).
+fn open_watching(watched: int, context ev: std::event_loop::Loop, n: event_loop_linux::Native, term: tui::session::Terminal) -> Opened errors tui::session::NotATerminal, tui::session::IoFailed, tui::session::TerminalBusy, std::event_loop::DriverFault, std::event_loop::SchedulerFault:
+    session = tui::session::open_driven()
+    {owner: source, reg: reg} = std::event_loop::owned_source(Delivery::Reliable, inbox_capacity, :keep_alive)
+    {owner: tap_owner, reg: tap_reg} = std::event_loop::owned_channel(Delivery::Reliable, tap_capacity)
+    {owner: tick_owner, reg: tick_reg} = std::event_loop::owned_every(size_poll_us)
+    input_watch = event_loop_linux::watch(watched, event_loop_linux::Interest::Readable, reg)
+    output_fd = tui::session::output_descriptor()
+    separate = output_fd != watched
+    output_watch = if separate:
+        event_loop_linux::watch(output_fd, event_loop_linux::Interest::Writable, reg):
+            on std::event_loop::DriverFault {code}:
+                event_loop_linux::unwatch(input_watch)
+                fail std::event_loop::DriverFault {code: code}
+    else:
+        input_watch
+    inbox = new_inbox(reg, tap_reg)
+    ports = Ports {inbox: inbox, input_watch: input_watch, output_watch: output_watch, separate_output: separate, tap: tap_reg, tick: tick_reg}
+    Opened {attached: Attached {tick: tick_owner, tap: tap_owner, source: source, session: session, input_watch: input_watch, output_watch: output_watch, separate_output: separate}, ports: ports}
+
+# Open the terminal for event-loop use (tui::session::open_driven) and register
+# its readiness with the loop; nothing runs yet.  Fails, with everything
+# already acquired released again, when the terminal is not a terminal
+# (NotATerminal), cannot be configured (IoFailed), already has a session
+# (TerminalBusy) or the readiness watch cannot be registered (DriverFault).
+fn open(context ev: std::event_loop::Loop, n: event_loop_linux::Native, term: tui::session::Terminal) -> Opened errors tui::session::NotATerminal, tui::session::IoFailed, tui::session::TerminalBusy, std::event_loop::DriverFault, std::event_loop::SchedulerFault:
+    open_watching(tui::session::input_descriptor())
+
+# --- the UI task
+
+# Record how the task ended (once) and release whoever waits on the inbox.
+private nomethod fn finish(inbox: Inbox, code: int, detail: str, context ui: Ui) -> int:
+    set_cell(cell_outcome, code + 1)
+    ui.detail.set(0, detail):
+        on IndexNotFound:
+            unit
+    code
+
+private fn empty_event() -> std::event_loop::Event:
+    std::event_loop::Event {reason: Wake::Empty, a: 0, b: 0, count: 0}
+
+# The next queued record, if any budget is left: Wake::Empty otherwise.
+private fn next_record(ports: Ports, budget: int, context ev: std::event_loop::Loop) -> std::event_loop::Event errors std::event_loop::SchedulerFault:
+    if budget <= 0:
+        return empty_event()
+    ports.inbox.reg.try_take()
+
+# A copy of EVENT for the controller task, when there is one.
+private fn tapped(ports: Ports, event: tui::input::Event, context ui: Ui) errors std::event_loop::SchedulerFault:
+    if cell(cell_tap) == 0:
+        return unit
+    packed = tui::input::pack(event)
+    result = ports.tap.post(packed.a, packed.b)
+    if result == Posted::Refused or result == Posted::Dropped:
+        bump(cell_tap_dropped)
+    unit
+
+private fn tapped_all(ports: Ports, events: List[tui::input::Event], context ui: Ui) errors std::event_loop::SchedulerFault:
+    loop event in events:
+        ports.tapped(event)
+    unit
+
+# One timer task: after the escape timeout, tell the UI task which held ESC
+# (SEQ) may now be resolved.  A later ESC makes the earlier timers stale.
+private nomethod fn escape_post(inbox: Inbox, seq: int, tries: int, context ev: std::event_loop::Loop) -> int errors std::event_loop::SchedulerFault:
+    result = inbox.reg.post(tagged(tag_escape, 0), seq)
+    if result != Posted::Refused or tries <= 0:
+        return 0
+    std::event_loop::sleep(5000)
+    escape_post(inbox, seq, tries - 1)
+
+private fn escape_timer(inbox: Inbox, seq: int, tries: int, context ev: std::event_loop::Loop) -> int errors std::event_loop::SchedulerFault:
+    std::event_loop::sleep(escape_timeout_us)
+    escape_post(inbox, seq, tries)
+
+private fn arm_escape(ports: Ports, context ev: std::event_loop::Loop, ui: Ui) errors std::event_loop::SchedulerFault:
+    seq = cell(cell_escape) + 1
+    set_cell(cell_escape, seq)
+    coroutine {step, first} = escape_timer(ports.inbox, seq, 20)
+    std::event_loop::adopt(step, first)
+    unit
+
+# One timer task: when the terminal cannot take output and has no watch of its
+# own (input and output are one descriptor), try again shortly.
+private fn retry_timer(inbox: Inbox, context ev: std::event_loop::Loop) -> int errors std::event_loop::SchedulerFault:
+    std::event_loop::sleep(2000)
+    inbox.reg.post(tagged(tag_retry, 0), 0)
+    0
+
+# The terminal's size, sampled on the loop's timer: a Resize reaches the
+# application as an ordinary event.  Only changes are posted, so an idle
+# terminal costs the UI task nothing.  A terminal that cannot be asked (gone,
+# zero-sized) keeps the last size.
+private nomethod fn size_ticker(inbox: Inbox, tick: std::event_loop::Reg, width: int, height: int, context ev: std::event_loop::Loop, term: tui::session::Terminal, ui: Ui) -> int errors std::event_loop::SchedulerFault:
+    woke = std::event_loop::wait(tick)
+    if woke.reason == Wake::Revoked or not inbox.running?():
+        return 1
+    now = tui::session::size():
+        on tui::session::NotATerminal {stream}:
+            return size_ticker(inbox, tick, width, height)
+    if now.width == width and now.height == height:
+        return size_ticker(inbox, tick, width, height)
+    result = inbox.reg.post(tagged(tag_size, 0), now.width.shift_left(16) + now.height)
+    if result == Posted::NotLive:
+        return 2
+    if result == Posted::Accepted:
+        return size_ticker(inbox, tick, now.width, now.height)
+    size_ticker(inbox, tick, width, height)
+
+# What reading the input found: the host after feeding every byte, the events,
+# and how the reading ended (Data: the budget ran out, more may be waiting).
+private struct Drained:
+    host: tui::host::Host
+    events: List[tui::input::Event]
+    state: tui::session::Reading
+
+private fn drain(host: tui::host::Host, events: List[tui::input::Event], budget: int, ports: Ports, context term: tui::session::Terminal, ui: Ui) -> Drained errors tui::session::IoFailed:
+    if budget <= 0:
+        return Drained {host: host, events: events, state: tui::session::Reading::Data}
+    read = tui::session::read_bytes()
+    if read.state == tui::session::Reading::Data:
+        add(cell_bytes_in, read.bytes.length())
+        fed = host.feed(read.bytes)
+        return fed.host.drain([events, fed.events].flat(), budget - 1, ports)
+    Drained {host: host, events: events, state: read.state}
+
+private fn merged(first: tui::host::Fed, second: tui::host::Fed) -> tui::host::Fed:
+    tui::host::Fed {host: second.host, events: [first.events, second.events].flat()}
+
+# Wait for the output descriptor to be writable (its watch), or, with no watch
+# of its own, for a short timer.
+private fn await_output(ports: Ports, context ev: std::event_loop::Loop, n: event_loop_linux::Native, ui: Ui) errors std::event_loop::SchedulerFault, std::event_loop::DriverFault:
+    bump(cell_write_blocks)
+    if ports.separate_output:
+        event_loop_linux::rearm(ports.output_watch)
+        return unit
+    coroutine {step, first} = retry_timer(ports.inbox)
+    std::event_loop::adopt(step, first)
+    unit
+
+# --- the state machine's state, apart from the application
+
+private struct Run:
+    host: tui::host::Host
+    ports: Ports
+    out: std::abi::bytes::Bytes
+    offset: int
+    blocked: bool
+    budget: int
+
+private fn with_host(run: Run, host: tui::host::Host) -> Run:
+    Run {host: host, ports: run.ports, out: run.out, offset: run.offset, blocked: run.blocked, budget: run.budget}
+
+private fn with_blocked(run: Run, blocked: bool) -> Run:
+    Run {host: run.host, ports: run.ports, out: run.out, offset: run.offset, blocked: blocked, budget: run.budget}
+
+private fn with_output(run: Run, out: std::abi::bytes::Bytes, offset: int, blocked: bool) -> Run:
+    Run {host: run.host, ports: run.ports, out: out, offset: offset, blocked: blocked, budget: run.budget}
+
+private fn with_budget(run: Run, budget: int) -> Run:
+    Run {host: run.host, ports: run.ports, out: run.out, offset: run.offset, blocked: run.blocked, budget: budget}
+
+# What reacting to one record decided: the new state, the events for the
+# application (in order), the terminal's own among them (for the tap), and the
+# outcome code when the task is to end (-1 otherwise).
+private struct Step:
+    run: Run
+    events: List[tui::input::Event]
+    keys: List[tui::input::Event]
+    code: int
+
+private fn quiet(run: Run) -> Step:
+    Step {run: run, events: [], keys: [], code: -1}
+
+private fn ending(host: tui::host::Host) -> int:
+    if host.closed:
+        return 1
+    0
+
+# The input descriptor is readable (or hung up): read what is there, decode it
+# (the shared decoder), and arm the watch again.
+private fn on_terminal(run: Run, bits: int, context ev: std::event_loop::Loop, n: event_loop_linux::Native, term: tui::session::Terminal, ui: Ui) -> Step errors tui::session::IoFailed, std::event_loop::SchedulerFault, std::event_loop::DriverFault:
+    ports = run.ports
+    free = if run.blocked and bit_and(bits, 2) != 0:
+        run.with_blocked(false)
+    else:
+        run
+    if bit_and(bits, 13) == 0:
+        return quiet(free)
+    drained = free.host.drain([], read_budget, ports)
+    gone = drained.state == tui::session::Reading::Closed or drained.state == tui::session::Reading::Hangup or (drained.state == tui::session::Reading::Idle and bit_and(bits, 12) != 0)
+    if gone:
+        ended = drained.host.end_of_input()
+        all = [drained.events, ended.events].flat()
+        return Step {run: free.with_host(ended.host), events: all, keys: all, code: -1}
+    event_loop_linux::rearm(ports.input_watch)
+    if tui::host::pending_input?(drained.host):
+        arm_escape(ports)
+    Step {run: free.with_host(drained.host), events: drained.events, keys: drained.events, code: -1}
+
+private fn react(run: Run, e: std::event_loop::Event, context ev: std::event_loop::Loop, n: event_loop_linux::Native, term: tui::session::Terminal, ui: Ui) -> Step errors tui::session::IoFailed, std::event_loop::SchedulerFault, std::event_loop::DriverFault:
+    ports = run.ports
+    kind = bit_and(e.a, 31)
+    if kind < 16:
+        return run.on_terminal(e.a)
+    if kind == tag_event:
+        bump(cell_delivered)
+        fed = run.host.deliver(tui::input::unpack(e.a.shift_right(5), e.b))
+        return Step {run: run.with_host(fed.host), events: fed.events, keys: [], code: -1}
+    if kind == tag_redraw:
+        set_cell(cell_redraw, 0)
+        return quiet(run.with_host(run.host.invalidate()))
+    if kind == tag_repaint:
+        set_cell(cell_repaint, 0)
+        return quiet(run.with_host(run.host.repaint()))
+    if kind == tag_size:
+        fed = run.host.resized(e.b.shift_right(16), bit_and(e.b, 65535))
+        if fed.events.length() > 0:
+            bump(cell_size_changes)
+        return Step {run: run.with_host(fed.host), events: fed.events, keys: [], code: -1}
+    if kind == tag_escape:
+        if e.b == cell(cell_escape) and run.host.pending_input?():
+            bump(cell_escape_timeouts)
+            fed = run.host.silence()
+            return Step {run: run.with_host(fed.host), events: fed.events, keys: fed.events, code: -1}
+        return quiet(run)
+    if kind == tag_close:
+        return Step {run: run, events: [], keys: [], code: 4}
+    if kind == tag_retry:
+        return quiet(run.with_blocked(false))
+    quiet(run)
+
+# The UI task's loop: one recursive function, because Botlish has no mutual
+# recursion and the application is a trait view that no struct can hold.  PENDING
+# is a record already taken from the inbox (Wake::Empty: none).  Each round:
+#   1. react to the pending record, apply its events to the application,
+#      and take the next record at once (up to the budget: a batch);
+#   2. write the frame in progress, a chunk at a time, yielding between chunks;
+#   3. plan a frame when the view is out of date and none is in progress;
+#   4. otherwise wait for the next record: the only place the task suspends
+#      for anything but its own yield.
+private nomethod fn pump(app: tui::app::Application, run: Run, pending: std::event_loop::Event, context ev: std::event_loop::Loop, n: event_loop_linux::Native, term: tui::session::Terminal, ui: Ui) -> int errors tui::session::IoFailed, tui::app::Abort, std::event_loop::SchedulerFault, std::event_loop::DriverFault:
+    ports = run.ports
+    if run.host.done?(app):
+        return ending(run.host)
+    if pending.reason == Wake::Revoked:
+        return 5
+    if pending.reason == Wake::Event:
+        step = run.react(pending)
+        if step.code >= 0:
+            return step.code
+        next = tui::app::apply_events(app, step.events, 0)
+        ports.tapped_all(step.keys)
+        add(cell_events_in, step.keys.length())
+        left = step.run.budget - 1
+        return pump(next, step.run.with_budget(left), ports.next_record(left))
+    total = tui::session::encoded_length(run.out)
+    if run.offset < total and not run.blocked:
+        reached = run.out.write_some(run.offset, write_chunk)
+        if reached == run.offset:
+            ports.await_output()
+            return pump(app, run.with_blocked(true), empty_event())
+        add(cell_bytes_out, reached - run.offset)
+        if reached < total:
+            bump(cell_partial_writes)
+            std::event_loop::yield_now()
+            return pump(app, run.with_output(run.out, reached, false), ports.next_record(run.budget))
+        bump(cell_frames)
+        return pump(app, run.with_output(tui::session::encode(""), 0, false), empty_event())
+    if run.offset >= total and run.host.wants_frame?(app):
+        frame = run.host.frame(app)
+        return pump(app, run.with_host(frame.host).with_output(tui::session::encode(frame.text), 0, false), empty_event())
+    woke = std::event_loop::wait(ports.inbox.reg)
+    bump(cell_wakes)
+    pump(app, run.with_budget(event_budget), woke)
+
+# The UI task: owns the terminal (ATTACHED) until it ends.  WIDTH x HEIGHT is
+# the terminal's size at the start.  Returns the outcome code (also in
+# outcome(inbox)); declared failures of the terminal or the application end
+# the task with their code, they do not fail it.
+fn serve(app: tui::app::Application, attached: Attached, ports: Ports, width: int, height: int, context ev: std::event_loop::Loop, n: event_loop_linux::Native, term: tui::session::Terminal, ui: Ui) -> int errors std::event_loop::SchedulerFault:
+    inbox = ports.inbox
+    start = Run {host: tui::host::new(width, height), ports: ports, out: tui::session::encode(""), offset: 0, blocked: false, budget: event_budget}
+    code = pump(app, start, empty_event()):
+        on tui::session::IoFailed {operation}:
+            return finish(inbox, 3, operation)
+        on tui::app::Abort {reason}:
+            return finish(inbox, 2, reason)
+        on std::event_loop::DriverFault {code}:
+            return finish(inbox, 6, "driver fault ".concat(std::int::to_string(code)))
+    finish(inbox, code, "")
+
+# Open the terminal and start the UI task and the size ticker in the
+# application's loop.  The first frame is written before start returns (unless
+# the terminal cannot take it yet).  Everything the application needs
+# afterwards is the Inbox.
+nomethod fn start(app: tui::app::Application, context ev: std::event_loop::Loop, n: event_loop_linux::Native, term: tui::session::Terminal, ui: Ui) -> Inbox errors tui::session::NotATerminal, tui::session::IoFailed, tui::session::TerminalBusy, std::event_loop::DriverFault, std::event_loop::SchedulerFault:
+    opened = open()
+    {attached, ports} = opened
+    size = tui::session::size()
+    coroutine {step, first} = serve(app, attached, ports, size.width, size.height)
+    std::event_loop::adopt(step, first)
+    coroutine {step: ticker, first: ticker_first} = size_ticker(ports.inbox, ports.tick, size.width, size.height)
+    std::event_loop::adopt(ticker, ticker_first)
+    ports.inbox

@@ -1,0 +1,13 @@
+packed event_loop_linux 0.5.0: /out/event_loop_linux-0.5.0.botpkg
+  sha256 ecd9e8114fa5bc24c2d23a2068e96ec2932e9386ca0cdb79fc568b9662146f77
+  8 files, 40216 bytes (110100 bytes unpacked)
+  provenance /out/event_loop_linux-0.5.0.provenance.json (sha256 499d3c698a81; bound to the artifact's sha256 ecd9e8114fa5; unsigned)
+  provenance: 8 files and 2 native files computed; 0 source(s), 2 build(s), 0 generator(s) asserted; 2 check(s) made
+    build event loop adapter linux-aarch64 output targets/linux-aarch64/native/libevent_loop_linux.a: confirmed
+    build event loop adapter linux-x86_64 output targets/linux-x86_64/native/libevent_loop_linux.a: confirmed
+  target linux-aarch64: 6 files, libraries event_loop_linux (bundled static)
+  target linux-x86_64: 6 files, libraries event_loop_linux (bundled static)
+  audit linux-aarch64: complete
+  audit linux-x86_64: complete
+  targets linux-aarch64, linux-x86_64
+  release: the recorded release of event_loop_linux 0.5.0 (packages/RELEASES.tsv)

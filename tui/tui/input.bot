@@ -48,9 +48,13 @@ enum Kind:
     Function,
     Resize,
     Unknown,
+    Custom,
 
 # One input event.  ch is the scalar value of a Char (and the number 1..12 of
-# a Function key); width/height are the new size of a Resize.
+# a Function key); width/height are the new size of a Resize.  A Custom event
+# is not from the terminal: an application-defined event that an event loop
+# delivers (a timer tick, a chunk of a stream, ...): ch is its code and width
+# its value (see custom, pack and unpack below).
 struct Event:
     kind: Kind
     ch: int
@@ -82,6 +86,12 @@ fn function_key(n: int) -> Event:
 
 nomethod fn resize(width: int, height: int) -> Event:
     Event {kind: Kind::Resize, ch: 0, ctrl: false, alt: false, shift: false, width: width, height: height}
+
+# An application-defined event: CODE says what happened, VALUE carries a number.
+# Nothing in the terminal produces one; an event-driven host delivers it to the
+# application's update function like any key.  Pure data: any int fits.
+nomethod fn custom(code: int, value: int) -> Event:
+    Event {kind: Kind::Custom, ch: code, ctrl: false, alt: false, shift: false, width: value, height: 0}
 
 private fn with_modifier_bits(event: Event, bits: int) -> Event:
     Event {kind: event.kind, ch: event.ch, ctrl: bit_and(bits, 4) != 0, alt: bit_and(bits, 2) != 0, shift: bit_and(bits, 1) != 0, width: event.width, height: event.height}
@@ -356,3 +366,59 @@ fn decode_text(text: str) -> List[Event]:
     ints = loop i from 0 to bs.length():
         tui::text::widen(bs.at(i))
     decode_all(ints)
+
+# --- events as two ints, to cross a channel that carries only two ints (an
+# event loop's post(reg, a, b)).  unpack(pack(e)) == e for every event the
+# decoder produces and for custom events, except that the width and the height
+# of a Resize are limited to 0..65535 (clamped).
+
+struct Packed:
+    a: int
+    b: int
+
+private fn kinds() -> List[Kind]:
+    [Kind::Char, Kind::Enter, Kind::Tab, Kind::BackTab, Kind::Backspace, Kind::Delete, Kind::Escape, Kind::Up, Kind::Down, Kind::Left, Kind::Right, Kind::Home, Kind::End, Kind::PageUp, Kind::PageDown, Kind::Insert, Kind::Function, Kind::Resize, Kind::Unknown, Kind::Custom]
+
+private fn kind_index(all: List[Kind], kind: Kind, i: int) -> int:
+    if i >= all.length():
+        return 18
+    if all.get(i, Kind::Unknown) == kind:
+        return i
+    all.kind_index(kind, i + 1)
+
+private nomethod fn flag(set: bool, weight: int) -> int:
+    if set:
+        return weight
+    0
+
+private fn clamp16(n: int) -> int:
+    if n < 0:
+        return 0
+    if n > 65535:
+        return 65535
+    n
+
+# EVENT as two ints: a = kind + 32 * modifier bits + 256 * ch; b = the value of
+# a Custom event, width * 65536 + height of a Resize, else 0.
+fn pack(event: Event) -> Packed:
+    bits = flag(event.shift, 1) + flag(event.alt, 2) + flag(event.ctrl, 4)
+    a = kinds().kind_index(event.kind, 0) + bits.shift_left(5) + event.ch.shift_left(8)
+    if event.kind == Kind::Custom:
+        return Packed {a: a, b: event.width}
+    if event.kind == Kind::Resize:
+        return Packed {a: a, b: clamp16(event.width).shift_left(16) + clamp16(event.height)}
+    Packed {a: a, b: 0}
+
+# The event packed as A and B (anything else decodes as an Unknown event).
+nomethod fn unpack(a: int, b: int) -> Event:
+    if a < 0:
+        return key(Kind::Unknown)
+    bits = bit_and(a.shift_right(5), 7)
+    ch = a.shift_right(8)
+    kind = kinds().get(bit_and(a, 31), Kind::Unknown)
+    base = Event {kind: kind, ch: ch, ctrl: bit_and(bits, 4) != 0, alt: bit_and(bits, 2) != 0, shift: bit_and(bits, 1) != 0, width: 0, height: 0}
+    if kind == Kind::Custom:
+        return Event {kind: kind, ch: ch, ctrl: base.ctrl, alt: base.alt, shift: base.shift, width: b, height: 0}
+    if kind == Kind::Resize:
+        return Event {kind: kind, ch: ch, ctrl: false, alt: false, shift: false, width: b.shift_right(16), height: bit_and(b, 65535)}
+    base

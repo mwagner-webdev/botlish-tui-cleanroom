@@ -1,0 +1,28 @@
+# bench_standalone -- the same monitor application (examples/monitor.bot) run by
+# the STANDALONE loop, tui::session::run, for the benchmark's comparison with
+# the event-loop host (examples/evdemo.bot).  Keys and resizes only: the
+# standalone loop has no way to receive the stream's and the timer's events.
+#
+#   botlish -emit-native-executable bench_standalone.bot
+
+import monitor
+import std::io
+import std::linux::io
+import std::str
+import tui::app
+import tui::session
+
+fn say(text: str):
+    std::io::print_line(text):
+        on std::io::WriteFailed:
+            unit
+
+with context std::linux::io::create()
+with context tui::session::create()
+tui::session::run(monitor::initial(100)):
+    on tui::session::NotATerminal {stream}:
+        say("bench_standalone: standard ".concat(stream).concat(" is not a terminal"))
+    on tui::session::IoFailed {operation}:
+        say("bench_standalone: terminal I/O failed during: ".concat(operation))
+    on tui::app::Abort {reason}:
+        say("bench_standalone: the application failed: ".concat(reason))

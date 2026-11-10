@@ -1,0 +1,125 @@
+# tui::host -- the bookkeeping of a running terminal application, without a
+# loop, a terminal or the application itself.
+#
+# A Host holds what survives between events: the input decoder, the renderer's
+# memory (tui::display), the terminal size, whether the view is out of date and
+# whether the input has ended.  Every transition is a pure function, so there
+# is nothing here to wait for, to schedule or to write:
+#
+#     bytes read            ->  feed        decode them
+#     silence after ESC     ->  silence     a lone Escape key
+#     window size read      ->  resized     a Resize event when it changed
+#     anything else         ->  deliver     an event the caller made (Custom)
+#     input ended           ->  end_of_input
+#
+# Each returns a Fed: the new Host and the events to apply to the application,
+# in order, with tui::app::apply_events (the application is the caller's: an
+# Application is a trait view, which no struct field can hold, so the caller
+# threads it and the Host never sees it).  Then, while a frame is wanted:
+#
+#     frame(host, app)      the bytes that bring the terminal up to date
+#     frame_failed(host)    if they were not written in full
+#
+# tui::session::run (its own wait-and-read loop) and the event-loop hosts apply
+# the same transitions, so they share the decoder, the event semantics and the
+# renderer.  Who decides WHEN each transition happens is the caller's.
+#
+# The view is dirty (a frame is wanted) exactly when a transition produced at
+# least one event, or invalidate was called, or a frame has not been written.
+
+import std::list
+import tui::app
+import tui::canvas
+import tui::display
+import tui::input
+
+struct Host:
+    decoder: tui::input::Decoder
+    display: tui::display::Display
+    width: int
+    height: int
+    dirty: bool
+    closed: bool
+
+struct Fed:
+    host: Host
+    events: List[tui::input::Event]
+
+# A host for a terminal of WIDTH x HEIGHT cells; nothing is drawn yet.
+nomethod fn new(width: int, height: int) -> Host:
+    Host {decoder: tui::input::new_decoder(), display: tui::display::new(), width: width, height: height, dirty: true, closed: false}
+
+# The session is over: the application finished or the input ended.
+fn done?(host: Host, app: tui::app::Application) -> bool:
+    host.closed or app.finished?()
+
+# A partial escape sequence is held: the caller should call silence after the
+# escape timeout (tui::session::escape_timeout_ms) without input.
+fn pending_input?(host: Host) -> bool:
+    tui::input::pending?(host.decoder)
+
+private fn produced(host: Host, decoder: tui::input::Decoder, events: List[tui::input::Event]) -> Fed:
+    Fed {host: Host {decoder: decoder, display: host.display, width: host.width, height: host.height, dirty: host.dirty or events.length() > 0, closed: host.closed}, events: events}
+
+# Decode BYTES (values 0..255, any chunking: one byte, many keys, half an
+# escape sequence).  The complete events are in the result; an incomplete
+# sequence stays in the host's decoder.
+fn feed(host: Host, bytes: List[int]) -> Fed:
+    fed = host.decoder.feed(bytes)
+    host.produced(fed.decoder, fed.events)
+
+# The escape timeout elapsed with nothing more to read: resolve a pending lone
+# ESC as the Escape key (and any other pending sequence as the decoder says).
+fn silence(host: Host) -> Fed:
+    flushed = tui::input::flush(host.decoder)
+    host.produced(flushed.decoder, flushed.events)
+
+# One event that did not come from the keyboard (a Custom event).
+fn deliver(host: Host, event: tui::input::Event) -> Fed:
+    host.produced(host.decoder, [event])
+
+# The terminal is now WIDTH x HEIGHT.  When that differs from the size the host
+# knows, the result holds a Resize event; otherwise nothing happens.
+fn resized(host: Host, width: int, height: int) -> Fed:
+    if width == host.width and height == host.height:
+        return Fed {host: host, events: []}
+    moved = Host {decoder: host.decoder, display: host.display, width: width, height: height, dirty: host.dirty, closed: host.closed}
+    moved.produced(host.decoder, [tui::input::resize(width, height)])
+
+# The input ended (end of file, hangup): whatever is pending is resolved, then
+# the host is closed.
+fn end_of_input(host: Host) -> Fed:
+    flushed = tui::input::flush(host.decoder)
+    fed = host.produced(flushed.decoder, flushed.events)
+    Fed {host: Host {decoder: fed.host.decoder, display: fed.host.display, width: fed.host.width, height: fed.host.height, dirty: fed.host.dirty, closed: true}, events: fed.events}
+
+# The view is out of date although no event reached the application (state it
+# keeps itself changed): a frame is wanted.
+fn invalidate(host: Host) -> Host:
+    Host {decoder: host.decoder, display: host.display, width: host.width, height: host.height, dirty: true, closed: host.closed}
+
+# True when a frame is wanted.
+fn wants_frame?(host: Host, app: tui::app::Application) -> bool:
+    host.dirty and not host.done?(app)
+
+struct Frame:
+    host: Host
+    text: str
+
+# The bytes that bring the terminal up to date with APP's view (empty when
+# nothing changed), and the host once they are written in full.
+fn frame(host: Host, app: tui::app::Application) -> Frame:
+    shown = app.view(host.width, host.height).rasterize()
+    planned = host.display.plan(shown)
+    Frame {host: Host {decoder: host.decoder, display: planned.display, width: host.width, height: host.height, dirty: false, closed: host.closed}, text: planned.text}
+
+# The frame was not written in full (failed or interrupted): the terminal's
+# contents are unknown, so the next frame repaints everything.
+fn frame_failed(host: Host) -> Host:
+    Host {decoder: host.decoder, display: tui::display::invalidate(host.display), width: host.width, height: host.height, dirty: true, closed: host.closed}
+
+# The terminal's contents can no longer be trusted (something else wrote to it,
+# a frame was interrupted): the next frame repaints every cell.  The same as
+# frame_failed; the name says why it is called.
+fn repaint(host: Host) -> Host:
+    host.frame_failed()

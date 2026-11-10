@@ -1,0 +1,32 @@
+# tui_event_loop_linux benchmark, 2026-11-09, 12 cores
+
+## the original standalone loop against its refactoring (taskapp demo, entry field focused)
+0.1.0 demo (original loop)         idle:   0.66 ms CPU/s,  10.0 wakeups/s
+0.2.0 demo (shared host)           idle:   0.81 ms CPU/s,  10.0 wakeups/s
+0.1.0 demo (original loop)         key->screen: p50   1.21  p95   3.73  max   5.47 ms  (n=80)
+0.2.0 demo (shared host)           key->screen: p50   1.26  p95   6.04  max   7.47 ms  (n=80)
+0.1.0 demo (original loop)         resize->frame: p50  51.32  p95  60.31  max  60.31 ms  (n=20)
+0.2.0 demo (shared host)           resize->frame: p50  52.27  p95  58.07  max  58.07 ms  (n=20)
+0.1.0 demo (original loop)         300x100 repaint: 71.1 ms, 7586 bytes
+0.2.0 demo (shared host)           300x100 repaint: 68.3 ms, 7586 bytes
+
+## the same monitor application, standalone loop against event-loop host
+standalone (tui::session::run)     idle:   0.80 ms CPU/s,  10.0 wakeups/s
+event loop (stream idle)           idle:   0.73 ms CPU/s,  10.0 wakeups/s
+standalone (tui::session::run)     key->screen: p50   1.47  p95   4.92  max   7.73 ms  (n=80)
+event loop (stream idle)           key->screen: p50   0.90  p95   4.07  max   5.40 ms  (n=80)
+standalone (tui::session::run)     resize->frame: p50  51.62  p95  52.66  max  52.66 ms  (n=20)
+event loop (stream idle)           resize->frame: p50  49.63  p95  52.10  max  52.10 ms  (n=20)
+standalone (tui::session::run)     300x100 repaint: 13.8 ms, 7075 bytes
+event loop (stream idle)           300x100 repaint: 62.6 ms, 7075 bytes
+standalone (tui::session::run)     200000-byte burst: 3.74 s (53 kB/s), final keys=200000, 3.73 s CPU
+event loop (stream idle)           200000-byte burst: 2.63 s (76 kB/s), final keys=200000, 2.63 s CPU
+
+## the event-loop host with unrelated work
+stream 100 Hz                      event->screen: p50   1.58  p95   2.75  max   5.09 ms  (n=986)
+stream 3 kHz                       event->screen: p50   1.93  p95   4.25  max  19.69 ms  (n=4327)
+idle                               timer 10 ms: n=646 mean 230 us  max 1431 us  <1ms:645  <5ms:1  <20ms:0  >=20ms:0   (frames 648, events 646)
+continuous key input               timer 10 ms: n=611 mean 906 us  max 4445 us  <1ms:344  <5ms:267  <20ms:0  >=20ms:0   (frames 3661, events 611)
+3 kHz stream (sustained redraws)   timer 10 ms: n=641 mean 432 us  max 8242 us  <1ms:601  <5ms:39  <20ms:1  >=20ms:0   (frames 9849, events 10460)
+3 kHz stream + key input           timer 10 ms: n=612 mean 1025 us  max 6050 us  <1ms:297  <5ms:310  <20ms:5  >=20ms:0   (frames 4495, events 5092)
+event loop                         50000 posts in bursts of 100: done in 0.68 s; frames 785 for 50003 events; sent 50000 delivered 50003

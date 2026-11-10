@@ -1,0 +1,116 @@
+# Pure tests of the demonstration application (examples/monitor.bot): events in,
+# screens out.  No terminal and no event loop: this is how an application of
+# tui_event_loop_linux is tested.  Any backend.
+import monitor
+import std::list
+import std::str
+import std::test
+import tui::app
+import tui::canvas
+import tui::input
+
+fn run(events: List[tui::input::Event]) -> monitor::Monitor errors tui::app::Abort:
+    fold e in events with intermediate m monitor::initial(10):
+        m.update(e)
+
+fn key(code: int) -> tui::input::Event:
+    tui::input::char_event(code)
+
+# The first N characters of S (all of it when it is shorter).
+fn prefix(s: str, n: int) -> str:
+    s.substring(0, n):
+        on LowerUnderrun:
+            return s
+        on UpperOverrun:
+            return s
+
+fn reg_state():
+    fn custom_events_update_the_state():
+        m = run([tui::input::custom(monitor::code_tick, 7), tui::input::custom(monitor::code_chunk, 3), tui::input::custom(monitor::code_stream, monitor::stream_running)]):
+            on tui::app::Abort:
+                return "abort"
+        m.status_line()
+    std::test::value("monitor: tick, chunk and stream events update the status line", " monitor | tick 7 | stream running | chunks 3/10 ", custom_events_update_the_state)
+
+    fn log_lists_events_in_order():
+        m = run([tui::input::custom(monitor::code_chunk, 1), key(97), tui::input::custom(monitor::code_chunk, 2)]):
+            on tui::app::Abort:
+                return []
+        m.log
+    std::test::value("monitor: the log keeps the order of keys and external events", ["ready", "chunk 1", "key a", "chunk 2"], log_lists_events_in_order)
+
+    fn quit_keys():
+        q = run([key(113)]):
+            on tui::app::Abort:
+                return "abort on q"
+        c = run([tui::input::ctrl_char(99)]):
+            on tui::app::Abort:
+                return "abort on c"
+        left = if q.finished?():
+            "quit"
+        else:
+            "stay"
+        right = if c.finished?():
+            "quit"
+        else:
+            "stay"
+        left.append_char(' ').concat(right)
+    std::test::value("monitor: q and Ctrl+C finish the application", "quit quit", quit_keys)
+
+    fn x_fails():
+        run([key(120)]):
+            on tui::app::Abort {reason}:
+                return reason
+        "no failure"
+    std::test::value("monitor: x fails on purpose with the application's own reason", "x pressed: simulated application failure", x_fails)
+
+    fn resize_is_logged():
+        m = run([tui::input::resize(100, 30)]):
+            on tui::app::Abort:
+                return {w: 0, h: 0, line: ""}
+        {w: m.width, h: m.height, line: m.log.get(1, "")}
+    std::test::value("monitor: a Resize event is applied and logged", {w: 100, h: 30, line: "resize 100x30"}, resize_is_logged)
+
+    fn log_is_capped():
+        events = loop i from 0 to 500:
+            tui::input::custom(monitor::code_chunk, i)
+        m = run(events):
+            on tui::app::Abort:
+                return -1
+        m.log.length()
+    std::test::value("monitor: the log is capped at 200 lines however many events arrive", 200, log_is_capped)
+
+    fn scroll_is_bounded_below():
+        m = run([tui::input::key(tui::input::Kind::Down), tui::input::key(tui::input::Kind::Down)]):
+            on tui::app::Abort:
+                return -1
+        m.scroll
+    std::test::value("monitor: scrolling down never goes below the newest line", 0, scroll_is_bounded_below)
+
+fn reg_view():
+    fn view_shows_the_state():
+        m = run([tui::input::custom(monitor::code_tick, 4), tui::input::custom(monitor::code_chunk, 5)]):
+            on tui::app::Abort:
+                return false
+        lines = m.frame(60, 12).lines()
+        lines.get(0, "").prefix(26) == " monitor | tick 4 | stream" and lines.get(1, "").prefix(3) == "[##" and lines.get(11, "").prefix(6) == "keys 0"
+    std::test::value("monitor: the view shows the status, the progress bar and the key counter", true, view_shows_the_state)
+
+    fn view_fits_every_size():
+        m = monitor::initial(10)
+        sizes = [{w: 1, h: 1}, {w: 10, h: 3}, {w: 80, h: 24}, {w: 200, h: 60}]
+        loop s in sizes:
+            m.frame(s.w, s.h).lines().length() == s.h
+    std::test::value("monitor: the view fits terminals of every size", [true, true, true, true], view_fits_every_size)
+
+    fn bar_is_proportional():
+        {none: monitor::bar(0, 10, 10), half: monitor::bar(5, 10, 10), all: monitor::bar(10, 10, 10), empty: monitor::bar(3, 0, 4)}
+    std::test::value("monitor: the progress bar is proportional (and safe for a zero total)", {none: "..........", half: "#####.....", all: "##########", empty: "...."}, bar_is_proportional)
+
+fn register_all():
+    reg_state()
+    reg_view()
+
+with context std::test::suite()
+register_all()
+std::test::report()

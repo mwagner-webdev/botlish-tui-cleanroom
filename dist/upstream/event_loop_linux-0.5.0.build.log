@@ -1,0 +1,6 @@
+native add: linux-aarch64 library event_loop_linux (bundled static) -> targets/linux-aarch64/native/libevent_loop_linux.a
+package stage: 1 header of /src/packages/event_loop_linux/native/botlish_event_loop.h -> targets/linux-aarch64/include (linux-aarch64): staged
+native add: linux-x86_64 library event_loop_linux (bundled static) -> targets/linux-x86_64/native/libevent_loop_linux.a
+package stage: 1 header of /src/packages/event_loop_linux/native/botlish_event_loop.h -> targets/linux-x86_64/include (linux-x86_64): staged
+native audit of event_loop_linux 0.5.0 (/tmp/botlish-package-repository_gyUTFy/event_loop_linux), from this host (linux-x86_64)
+packed event_loop_linux 0.5.0: /out/event_loop_linux-0.5.0.botpkg

@@ -37,6 +37,21 @@ fn run_outcome(context term: tui::session::Terminal) -> str:
             return "aborted: ".concat(reason)
     "ran"
 
+fn driven_outcome(context term: tui::session::Terminal) -> str:
+    session = tui::session::open_driven():
+        on tui::session::NotATerminal {stream}:
+            return "not a terminal: ".concat(stream)
+        on tui::session::IoFailed {operation}:
+            return "io failed: ".concat(operation)
+        on tui::session::TerminalBusy {reason}:
+            return "busy"
+    "opened"
+
+fn owned_outcome(context term: tui::session::Terminal) -> str:
+    if tui::session::owned?():
+        return "owned"
+    "free"
+
 fn size_outcome(context term: tui::session::Terminal) -> str:
     tui::session::size():
         on tui::session::NotATerminal {stream}:
@@ -45,7 +60,7 @@ fn size_outcome(context term: tui::session::Terminal) -> str:
 
 # Test bodies cannot require a context, so the outcomes are computed at the top
 # level (where the Terminal context is installed) and the cases capture them.
-fn reg_session(on_terminal: bool, run_result: str, size_result: str):
+fn reg_session(on_terminal: bool, run_result: str, size_result: str, driven_result: str, owned_result: str):
     fn constants():
         {escape_ms: tui::session::escape_timeout_ms, resize_ms: tui::session::resize_poll_ms}
     std::test::value("session: documented timing constants", {escape_ms: 50, resize_ms: 100}, constants)
@@ -56,10 +71,24 @@ fn reg_session(on_terminal: bool, run_result: str, size_result: str):
         "".concat(run_result).concat(" | ").concat(size_result)
     std::test::value("session: without a terminal, run and size fail with NotATerminal naming the stream, and touch nothing", "not a terminal: input | not a terminal: output", consistent_without_a_terminal)
 
+    fn driven_consistent():
+        if on_terminal:
+            return "skipped: stdin and stdout are a terminal"
+        driven_result
+    std::test::value("session: without a terminal, open_driven fails with NotATerminal naming the stream", "not a terminal: input", driven_consistent)
+
+    fn nothing_left_owned():
+        if on_terminal:
+            return "skipped: stdin and stdout are a terminal"
+        owned_result
+    std::test::value("session: a failed run and a failed open_driven leave the terminal unowned", "free", nothing_left_owned)
+
 with context std::test::suite()
 with context tui::session::create()
 on_terminal = tui::session::tty?()
 run_result = run_outcome()
 size_result = size_outcome()
-on_terminal.reg_session(run_result, size_result)
+driven_result = driven_outcome()
+owned_result = owned_outcome()
+on_terminal.reg_session(run_result, size_result, driven_result, owned_result)
 std::test::report()

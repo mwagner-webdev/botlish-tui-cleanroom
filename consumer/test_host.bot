@@ -1,0 +1,204 @@
+# Pure tests of the pieces the event-loop integration shares with the
+# standalone session: Custom events and their two-int packing, the renderer's
+# memory (tui::display) and the Host's transitions (tui::host).  No terminal.
+import std::list
+import std::str
+import std::test
+import tui::app
+import tui::canvas
+import tui::display
+import tui::host
+import tui::input
+import tui::style
+import tui::text
+
+# A counter application: digits add, Custom events (code 7) add their value,
+# q finishes, a Resize records the size.  The view shows the numbers.
+struct Counter:
+    total: int
+    customs: int
+    done: bool
+    seen_width: int
+    seen_height: int
+
+fn update(app: Counter, event: tui::input::Event) -> Counter:
+    if event.kind == tui::input::Kind::Custom and event.ch == 7:
+        return Counter {total: app.total + event.width, customs: app.customs + 1, done: app.done, seen_width: app.seen_width, seen_height: app.seen_height}
+    if event.kind == tui::input::Kind::Resize:
+        return Counter {total: app.total, customs: app.customs, done: app.done, seen_width: event.width, seen_height: event.height}
+    if event.is_char?(113):
+        return Counter {total: app.total, customs: app.customs, done: true, seen_width: app.seen_width, seen_height: app.seen_height}
+    if event.kind == tui::input::Kind::Char and event.ch >= 48 and event.ch <= 57:
+        return Counter {total: app.total + event.ch - 48, customs: app.customs, done: app.done, seen_width: app.seen_width, seen_height: app.seen_height}
+    app
+
+fn view(app: Counter, width: int, height: int) -> tui::canvas::Canvas:
+    tui::canvas::new(width, height).text(0, 0, "total=".concat(tui::text::from_codepoints([48 + app.total])), tui::style::plain())
+
+fn finished?(app: Counter) -> bool:
+    app.done
+
+fn fresh() -> Counter:
+    Counter {total: 0, customs: 0, done: false, seen_width: 0, seen_height: 0}
+
+fn bytes_of(s: str) -> List[int]:
+    bs = s.encode_utf8()
+    loop i from 0 to bs.length():
+        tui::text::widen(bs.at(i))
+
+# A row of booleans as "TFT", of ints as "1,2": one value to compare.
+nomethod fn pattern(flags: List[bool]) -> str:
+    fold f in flags with intermediate acc "":
+        if f:
+            acc.append_char('T')
+        else:
+            acc.append_char('F')
+
+fn roundtrip(e: tui::input::Event) -> tui::input::Event:
+    p = tui::input::pack(e)
+    tui::input::unpack(p.a, p.b)
+
+fn reg_pack():
+    fn plain_keys():
+        events = [tui::input::char_event(97), tui::input::char_event(8364), tui::input::ctrl_char(99), tui::input::char_event(120).with_alt(), tui::input::key(tui::input::Kind::Up).with_shift().with_ctrl(), tui::input::key(tui::input::Kind::Enter), tui::input::function_key(7), tui::input::key(tui::input::Kind::Escape), tui::input::key(tui::input::Kind::Unknown)]
+        loop e in events:
+            roundtrip(e) == e
+    std::test::value("pack: every kind of terminal event survives two ints", [true, true, true, true, true, true, true, true, true], plain_keys)
+
+    fn resize_and_custom():
+        pattern([roundtrip(tui::input::resize(120, 40)) == tui::input::resize(120, 40), roundtrip(tui::input::custom(7, 123456789012)) == tui::input::custom(7, 123456789012), roundtrip(tui::input::custom(3, -5)) == tui::input::custom(3, -5)])
+    std::test::value("pack: Resize and Custom events (any int value) round-trip", "TTT", resize_and_custom)
+
+    fn clamped():
+        e = roundtrip(tui::input::resize(70000, -3))
+        {w: e.width, h: e.height}
+    std::test::value("pack: Resize sizes are limited to 0..65535", {w: 65535, h: 0}, clamped)
+
+    fn garbage():
+        e = tui::input::unpack(-1, 0)
+        f = tui::input::unpack(31, 0)
+        pattern([e.kind == tui::input::Kind::Unknown, f.kind == tui::input::Kind::Unknown])
+    std::test::value("pack: a malformed pair decodes as Unknown, never fails", "TT", garbage)
+
+fn reg_display():
+    fn first_is_full():
+        d = tui::display::new()
+        screen = fresh().view(8, 2).rasterize()
+        f = d.plan(screen)
+        pattern([tui::display::unknown?(d), f.text.length() > 0, tui::display::unknown?(f.display)])
+    std::test::value("display: a new display is unknown; the first plan paints, and then it is known", "TTF", first_is_full)
+
+    fn unchanged_is_empty():
+        screen = fresh().view(8, 2).rasterize()
+        f = tui::display::new().plan(screen)
+        g = f.display.plan(screen)
+        g.text
+    std::test::value("display: an identical screen produces no bytes", "", unchanged_is_empty)
+
+    fn incremental():
+        a = fresh().view(8, 2).rasterize()
+        b = Counter {total: 5, customs: 0, done: false, seen_width: 0, seen_height: 0}.view(8, 2).rasterize()
+        f = tui::display::new().plan(a)
+        g = f.display.plan(b)
+        h = tui::display::new().plan(b)
+        pattern([g.text.length() > 0, g.text.length() < h.text.length()])
+    std::test::value("display: a small change is smaller than a full repaint", "TT", incremental)
+
+    fn invalidated_repaints():
+        a = fresh().view(8, 2).rasterize()
+        f = tui::display::new().plan(a)
+        g = f.display.invalidate().plan(a)
+        h = tui::display::new().plan(a)
+        pattern([tui::display::unknown?(f.display.invalidate()), g.text == h.text])
+    std::test::value("display: after a failed frame (invalidate) the next plan repaints everything", "TT", invalidated_repaints)
+
+fn reg_host():
+    fn feed_decodes_and_marks_dirty():
+        h = tui::host::new(10, 3)
+        framed = h.frame(fresh())
+        fed = framed.host.feed(bytes_of("12"))
+        {after_frame: framed.host.dirty, after_events: fed.host.dirty, events: fed.events.length()}
+    std::test::value("host: a frame clears the dirty flag; decoded events set it", {after_frame: false, after_events: true, events: 2}, feed_decodes_and_marks_dirty)
+
+    fn no_events_no_dirty():
+        framed = tui::host::new(10, 3).frame(fresh())
+        fed = framed.host.feed([27])
+        {dirty: fed.host.dirty, events: fed.events.length(), pending: tui::host::pending_input?(fed.host)}
+    std::test::value("host: a held ESC is no event: not dirty, but pending", {dirty: false, events: 0, pending: true}, no_events_no_dirty)
+
+    fn silence_is_escape():
+        framed = tui::host::new(10, 3).frame(fresh())
+        held = framed.host.feed([27])
+        sil = held.host.silence()
+        pattern([sil.events == [tui::input::key(tui::input::Kind::Escape)], tui::host::pending_input?(sil.host), sil.host.dirty])
+    std::test::value("host: silence resolves the held ESC as Escape", "TFT", silence_is_escape)
+
+    fn split_sequence_kept():
+        h = tui::host::new(10, 3)
+        a = h.feed([27, 91])
+        b = a.host.feed([65])
+        {first: a.events.length(), second_is_up: b.events == [tui::input::key(tui::input::Kind::Up)]}
+    std::test::value("host: an escape sequence split across feeds decodes once, when complete", {first: 0, second_is_up: true}, split_sequence_kept)
+
+    fn resize_only_on_change():
+        h = tui::host::new(10, 3)
+        same = h.resized(10, 3)
+        diff = h.resized(12, 5)
+        {same: same.events.length(), changed: diff.events == [tui::input::resize(12, 5)], width: diff.host.width, height: diff.host.height}
+    std::test::value("host: resized yields a Resize event only when the size changed", {same: 0, changed: true, width: 12, height: 5}, resize_only_on_change)
+
+    fn deliver_custom():
+        h = tui::host::new(10, 3)
+        fed = h.deliver(tui::input::custom(7, 4))
+        app = tui::app::apply_events(fresh(), fed.events, 0):
+            on tui::app::Abort:
+                return false
+        fr = h.frame(app)
+        fr.text.length() > 0 and fed.host.dirty
+    std::test::value("host: a Custom event is applied like a key and wants a frame", true, deliver_custom)
+
+    fn end_of_input_closes():
+        h = tui::host::new(10, 3)
+        held = h.feed([27])
+        ended = held.host.end_of_input()
+        pattern([ended.events == [tui::input::key(tui::input::Kind::Escape)], ended.host.closed, ended.host.done?(fresh())])
+    std::test::value("host: end of input flushes the pending ESC and closes the host", "TTT", end_of_input_closes)
+
+    fn finished_app_is_done():
+        h = tui::host::new(10, 3)
+        fed = h.feed(bytes_of("q "))
+        app = tui::app::apply_events(fresh(), fed.events, 0):
+            on tui::app::Abort:
+                return "abort"
+        pattern([fed.host.done?(app), fed.host.wants_frame?(app)])
+    std::test::value("host: a finished application ends the session and wants no more frames", "TF", finished_app_is_done)
+
+    fn frame_failed_repaints():
+        h = tui::host::new(10, 3)
+        f = h.frame(fresh())
+        again = f.host.frame(fresh())
+        failed = tui::host::frame_failed(f.host).frame(fresh())
+        {again: again.text, repainted: failed.text.length() > 0, identical: failed.text == f.text}
+    std::test::value("host: a frame that was not written in full is repainted entirely", {again: "", repainted: true, identical: true}, frame_failed_repaints)
+
+    fn invalidate_wants_frame():
+        h = tui::host::new(10, 3)
+        f = h.frame(fresh())
+        pattern([f.host.wants_frame?(fresh()), f.host.invalidate().wants_frame?(fresh())])
+    std::test::value("host: invalidate asks for a frame, nothing else does", "FT", invalidate_wants_frame)
+
+    fn bytes_equal_events_decoder():
+        text = "7q"
+        direct = tui::input::decode_all(bytes_of(text))
+        via = tui::host::new(10, 3).feed(bytes_of(text))
+        via.events == direct
+    std::test::value("host: feed produces exactly the decoder's events (one decoder, two modes)", true, bytes_equal_events_decoder)
+
+fn register_all():
+    reg_pack()
+    reg_display()
+    reg_host()
+
+with context std::test::suite()
+register_all()
+std::test::report()

@@ -1,0 +1,184 @@
+# monitor -- the state machine and view of the event-loop demonstration.
+#
+# A small status screen: a tick counter driven by a timer, the progress of a
+# simulated stream of chunks, a log of everything that happened (keys, chunks,
+# state changes, resizes).  It has no idea where its events come from: keys and
+# resizes are the terminal's, the rest are Custom events that other tasks of
+# the program post.  Nothing here touches a terminal or an event loop, so the
+# whole application is tested by feeding it events (tests/test_monitor.bot).
+#
+# Keys:  s start the stream   p pause / resume   c cancel   r repaint
+#        Up/Down scroll the log   x fail on purpose   q or Ctrl+C quit
+
+import std::int
+import std::list
+import std::str
+import tui::app
+import tui::canvas
+import tui::input
+import tui::layout
+import tui::style
+import tui::text
+import tui::widgets
+
+# The codes of the Custom events.
+code_tick = 1
+code_chunk = 2
+code_stream = 3
+code_stamp = 4
+
+# The states of the stream (the value of a code_stream event).
+stream_idle = 0
+stream_running = 1
+stream_paused = 2
+stream_cancelled = 3
+stream_done = 4
+
+log_limit = 200
+
+struct Monitor:
+    ticks: int
+    stream: int
+    chunks: int
+    total: int
+    log: List[str]
+    scroll: int
+    keys: int
+    stamp: int
+    width: int
+    height: int
+    quit: bool
+
+nomethod fn initial(total: int) -> Monitor:
+    Monitor {ticks: 0, stream: stream_idle, chunks: 0, total: total, log: ["ready"], scroll: 0, keys: 0, stamp: 0, width: 0, height: 0, quit: false}
+
+fn stream_name(state: int) -> str:
+    if state == stream_running:
+        return "running"
+    if state == stream_paused:
+        return "paused"
+    if state == stream_cancelled:
+        return "cancelled"
+    if state == stream_done:
+        return "done"
+    "idle"
+
+private fn with_log(m: Monitor, line: str) -> Monitor:
+    kept = if m.log.length() >= log_limit:
+        loop i from 1 to m.log.length():
+            m.log.get(i, "")
+    else:
+        m.log
+    Monitor {ticks: m.ticks, stream: m.stream, chunks: m.chunks, total: m.total, log: [kept, [line]].flat(), scroll: m.scroll, keys: m.keys, stamp: m.stamp, width: m.width, height: m.height, quit: m.quit}
+
+private fn with_scroll(m: Monitor, scroll: int) -> Monitor:
+    Monitor {ticks: m.ticks, stream: m.stream, chunks: m.chunks, total: m.total, log: m.log, scroll: scroll, keys: m.keys, stamp: m.stamp, width: m.width, height: m.height, quit: m.quit}
+
+private fn with_counts(m: Monitor, ticks: int, stream: int, chunks: int) -> Monitor:
+    Monitor {ticks: ticks, stream: stream, chunks: chunks, total: m.total, log: m.log, scroll: m.scroll, keys: m.keys, stamp: m.stamp, width: m.width, height: m.height, quit: m.quit}
+
+private fn with_key(m: Monitor, quit: bool) -> Monitor:
+    Monitor {ticks: m.ticks, stream: m.stream, chunks: m.chunks, total: m.total, log: m.log, scroll: m.scroll, keys: m.keys + 1, stamp: m.stamp, width: m.width, height: m.height, quit: quit}
+
+private fn with_size(m: Monitor, width: int, height: int) -> Monitor:
+    Monitor {ticks: m.ticks, stream: m.stream, chunks: m.chunks, total: m.total, log: m.log, scroll: m.scroll, keys: m.keys, stamp: m.stamp, width: width, height: height, quit: m.quit}
+
+# A short name for a key, for the log.
+fn key_name(event: tui::input::Event) -> str:
+    if event.kind == tui::input::Kind::Char:
+        if event.ctrl:
+            return "ctrl-".concat(tui::text::char_string(event.ch))
+        if event.alt:
+            return "alt-".concat(tui::text::char_string(event.ch))
+        return tui::text::char_string(event.ch)
+    if event.kind == tui::input::Kind::Enter:
+        return "enter"
+    if event.kind == tui::input::Kind::Tab:
+        return "tab"
+    if event.kind == tui::input::Kind::Escape:
+        return "escape"
+    if event.kind == tui::input::Kind::Up:
+        return "up"
+    if event.kind == tui::input::Kind::Down:
+        return "down"
+    if event.kind == tui::input::Kind::Left:
+        return "left"
+    if event.kind == tui::input::Kind::Right:
+        return "right"
+    if event.kind == tui::input::Kind::Backspace:
+        return "backspace"
+    if event.kind == tui::input::Kind::Function:
+        return "".append_char('f').concat(std::int::to_string(event.ch))
+    "other"
+
+private fn key_event(m: Monitor, event: tui::input::Event) -> Monitor errors tui::app::Abort:
+    if event.is_ctrl?(99):
+        return m.with_key(true).with_log("key ctrl-c: quit")
+    if event.is_char?(113):
+        return m.with_key(true).with_log("key q: quit")
+    if event.is_char?(120):
+        fail tui::app::Abort {reason: "x pressed: simulated application failure"}
+    if event.kind == tui::input::Kind::Up:
+        return m.with_key(false).with_scroll(m.scroll + 1).with_log("key up")
+    if event.kind == tui::input::Kind::Down:
+        scrolled = if m.scroll > 0:
+            m.scroll - 1
+        else:
+            0
+        return m.with_key(false).with_scroll(scrolled).with_log("key down")
+    m.with_key(false).with_log("key ".concat(key_name(event)))
+
+# The state machine: state + event -> next state.
+fn update(m: Monitor, event: tui::input::Event) -> Monitor errors tui::app::Abort:
+    if event.kind == tui::input::Kind::Custom:
+        if event.ch == code_tick:
+            return m.with_counts(event.width, m.stream, m.chunks)
+        if event.ch == code_chunk:
+            return m.with_counts(m.ticks, m.stream, event.width).with_log("chunk ".concat(std::int::to_string(event.width)))
+        if event.ch == code_stamp:
+            return Monitor {ticks: m.ticks, stream: m.stream, chunks: m.chunks, total: m.total, log: m.log, scroll: m.scroll, keys: m.keys, stamp: event.width, width: m.width, height: m.height, quit: m.quit}
+        if event.ch == code_stream:
+            return m.with_counts(m.ticks, event.width, m.chunks).with_log("stream ".concat(stream_name(event.width)))
+        return m.with_log("custom ".concat(std::int::to_string(event.ch)))
+    if event.kind == tui::input::Kind::Resize:
+        return m.with_size(event.width, event.height).with_log("resize ".concat(std::int::to_string(event.width)).append_char('x').concat(std::int::to_string(event.height)))
+    m.key_event(event)
+
+fn finished?(m: Monitor) -> bool:
+    m.quit
+
+# "####....": DONE of TOTAL as WIDTH cells.
+fn bar(done: int, total: int, width: int) -> str:
+    cps = loop i from 0 to width:
+        if total > 0 and (i + 1) * total <= done * width:
+            35
+        else:
+            46
+    tui::text::from_codepoints(cps)
+
+fn status_line(m: Monitor) -> str:
+    " monitor | tick ".concat(std::int::to_string(m.ticks)).concat(" | stream ").concat(stream_name(m.stream)).concat(" | chunks ").concat(std::int::to_string(m.chunks)).append_char('/').concat(std::int::to_string(m.total)).append_char(' ')
+
+# The log lines visible in ROWS rows, scrolled up by m.scroll from the newest.
+fn visible_log(m: Monitor, rows: int) -> List[str]:
+    last = m.log.length() - m.scroll
+    first = if last - rows > 0:
+        last - rows
+    else:
+        0
+    loop i from first to last:
+        m.log.get(i, "")
+
+fn view(m: Monitor, width: int, height: int) -> tui::canvas::Canvas:
+    plain = tui::style::plain()
+    rows = if height - 6 > 1:
+        height - 6
+    else:
+        1
+    lines = loop line in m.visible_log(rows):
+        tui::layout::label(line, plain)
+    progress = tui::layout::label("".append_char('[').concat(m.chunks.bar(m.total, width - 4)).append_char(']'), plain.with_fg(tui::style::green))
+    log_box = tui::layout::vstack(lines).boxed("log", tui::canvas::BorderKind::Single, plain).with_flex(1)
+    help = tui::layout::label("s start  p pause  c cancel  r repaint  Up/Down scroll  q quit", plain.dim())
+    ui = tui::layout::vstack([tui::widgets::status_bar(status_line(m), plain.bold()), progress, log_box, help, tui::widgets::status_bar("keys ".concat(std::int::to_string(m.keys)).concat(" stamp ").concat(std::int::to_string(m.stamp)), plain)])
+    tui::canvas::new(width, height).draw(ui)

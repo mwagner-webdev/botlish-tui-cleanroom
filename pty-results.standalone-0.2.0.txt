@@ -1,0 +1,29 @@
+# consumer/: unmodified pty_acceptance.py against demo built from the installed tui-0.2.0.botpkg
+PASS PTY: cooked mode before start (echo, icanon, isig)
+PASS first frame drawn (title bar)
+PASS alternate screen entered, cursor hidden
+PASS first frame shows the selected row
+PASS raw mode while running (no echo, no canon, no isig)
+PASS idle for 2 s costs < 0.1 s CPU (no busy polling)
+PASS Down arrow moves the selection
+PASS Space toggles the task (state + status line)
+PASS escape sequence split across three writes decodes as Down
+PASS Tab focuses the entry; typed text appears in the editor
+PASS Backspace edits the entry
+PASS Enter adds the task (status, count, list)
+PASS a lone Escape (timeout policy) clears the entry
+PASS resize is noticed and reported to the application
+PASS after resize the frame fills the new size (status bar on row 30)
+PASS shrinking is handled too
+PASS q exits; process terminated by itself within the timeout
+PASS leave sequences sent (cursor shown, alternate screen left)
+PASS final message printed after the restore
+PASS terminal state restored after normal exit (echo, icanon, isig, icrnl)
+PASS error path: application failure leaves the session and the process ends
+PASS error path: message printed on the restored main screen
+PASS error path: terminal state restored
+PASS Ctrl+C is delivered as a key (ISIG off) and quits cleanly
+PASS Ctrl+D is an ordinary key (no EOF in raw mode); app still running
+PASS without a terminal: explicit NotATerminal path, one plain frame, no raw mode
+
+26 checks, 26 passed, 0 failed

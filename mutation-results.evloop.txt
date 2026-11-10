@@ -1,0 +1,23 @@
+# mutate.py final run (compiler 0a518ba); one edit per mutant; "KILLED" = the check named after the dashes failed
+input-watch-never-rearmed          KILLED                 222s  FAIL keys: three keys in one read arrive as three events, in order  -- [-1, -1, -1]
+terminal-read-blocking             KILLED                 220s  FAIL startup: the input descriptor is nonblocking while running (kernel flags)  -- 2
+parser-discards-partial-sequence   KILLED                 217s  FAIL keys: an escape sequence split across three reads decodes as one key (left)  -- ['┌─ log ────────────────────────────────────────────────────────
+external-updates-never-redraw      KILLED                 227s  FAIL stream: external events redraw the screen with no keyboard input (chunks >= 5)
+pending-redraw-starves-timers      KILLED                 225s  FAIL blocked output: timers kept running (the ticker task never woke more than 500 ms late)  -- {'n': '87', 'mean_us': '46289', 'max_us': '3857354', '
+terminal-mode-not-restored         KILLED                 428s  FAIL restore: echo, canon, isig back after the UI task ended (loop still running)  -- {'echo': False, 'icanon': False, 'isig': False, 'icrnl': False}
+descriptor-flags-not-restored      KILLED                 214s  FAIL restore: descriptor flags back (O_NONBLOCK cleared) after the UI task ended  -- 2050
+watch-not-revoked-on-release       KILLED                 215s  FAIL watch revoked: typing at the terminal after the UI ended produced no readiness record  -- {'watch_events_after_release': '1'}
+two-owners-accepted                KILLED                 215s  FAIL busy: a second owner is refused (TerminalBusy) while the first is running  -- {'second': 'driver', 'standalone': 'opened', 'first_outcome': '4', 
+resize-never-delivered             KILLED                 229s  FAIL resize: a size change while idle is delivered to the application (log line) within 3 s  -- ['', '', '', '', '', '', '', '']
+escape-timer-ignored               KILLED                 219s  FAIL keys: a lone Escape is resolved by the loop timer (50 ms), not lost  -- ['┌─ log ────────────────────────────────────────────────────────────────
+writable-never-seen                KILLED                 221s  FAIL blocked output: timers kept running while the terminal did not drain (ticks follow wall time)  -- (0, 0, 7.20453143119812)
+repaint-flag-never-cleared         KILLED                 217s  FAIL redraw: a second repaint request is honoured too (the coalescing flag is released)  -- (3, 3)
+tap-never-posts                    KILLED                 226s  FAIL stream: p pauses
+hangup-not-recognised              KILLED                 228s  FAIL terminal hangup (EIO on read): the input has ended (outcome 1), no busy loop, program exits
+
+15 mutants, 15 killed by the test meant for them, 0 not
+
+# unmutated baseline against every scenario the mutants use
+baseline                           BASELINE-OK            254s  
+
+1 mutants, 1 killed by the test meant for them, 0 not

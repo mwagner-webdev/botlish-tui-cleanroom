@@ -12,3 +12,16 @@
 /dev/bench
 __pycache__/
 *.pyc
+/botlish
+/botlish-linux-x86_64.zip
+/consumer-evloop/evdemo
+/consumer-evloop/evcases
+/consumer-evloop/bench_standalone
+/consumer-evloop/minimal
+/devloop/.bot_modules/
+/devloop/evdemo
+/devloop/evcases
+/devloop/bench_standalone
+/devloop/minimal
+/devloop/demo-0.1.0
+/consumer-evloop/demo-0.1.0
